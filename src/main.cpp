@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <string>
 
+#include "../resources/resource.h"
 #include "common.h"
 #include "WitcherControl_h.h"
 
@@ -76,11 +77,13 @@ bool QueryServiceState(DWORD* state) {
 
     SERVICE_STATUS_PROCESS status{};
     DWORD bytes_needed = 0;
-    const BOOL ok = QueryServiceStatusEx(service,
-                                         SC_STATUS_PROCESS_INFO,
-                                         reinterpret_cast<LPBYTE>(&status),
-                                         sizeof(status),
-                                         &bytes_needed);
+    const BOOL ok = QueryServiceStatusEx(
+        service,
+        SC_STATUS_PROCESS_INFO,
+        reinterpret_cast<LPBYTE>(&status),
+        sizeof(status),
+        &bytes_needed);
+
     if (ok && state) {
         *state = status.dwCurrentState;
     }
@@ -104,7 +107,13 @@ bool StartServiceAndWaitRunning() {
 
     SERVICE_STATUS_PROCESS status{};
     DWORD bytes_needed = 0;
-    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
+
+    if (!QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            reinterpret_cast<LPBYTE>(&status),
+            sizeof(status),
+            &bytes_needed)) {
         CloseServiceHandle(service);
         CloseServiceHandle(scm);
         return false;
@@ -116,13 +125,20 @@ bool StartServiceAndWaitRunning() {
 
     bool running = false;
     for (int i = 0; i < 50; ++i) {
-        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
+        if (!QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                reinterpret_cast<LPBYTE>(&status),
+                sizeof(status),
+                &bytes_needed)) {
             break;
         }
+
         if (status.dwCurrentState == SERVICE_RUNNING) {
             running = true;
             break;
         }
+
         Sleep(200);
     }
 
@@ -145,6 +161,7 @@ DWORD GetParentProcessId() {
 
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
+
     DWORD parent_pid = 0;
     if (Process32FirstW(snapshot, &entry)) {
         do {
@@ -167,6 +184,7 @@ std::wstring GetProcessImageBaseName(DWORD pid) {
 
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
+
     std::wstring name;
     if (Process32FirstW(snapshot, &entry)) {
         do {
@@ -193,18 +211,22 @@ bool IsParentServiceProcess() {
 
 void RequestServiceStop() {
     RPC_WSTR string_binding = nullptr;
-    RPC_STATUS status = RpcStringBindingComposeW(nullptr,
-                                                 reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
-                                                 nullptr,
-                                                 reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(witcher::kRpcEndpoint)),
-                                                 nullptr,
-                                                 &string_binding);
+
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(witcher::kRpcEndpoint)),
+        nullptr,
+        &string_binding);
+
     if (status != RPC_S_OK) {
         return;
     }
 
     status = RpcBindingFromStringBindingW(string_binding, &WitcherControl_IfHandle);
     RpcStringFreeW(&string_binding);
+
     if (status != RPC_S_OK) {
         return;
     }
@@ -231,6 +253,7 @@ void ShowMainWindow() {
 void RemoveTrayIcon() {
     if (g_tray_icon.cbSize != 0) {
         Shell_NotifyIconW(NIM_DELETE, &g_tray_icon);
+        g_tray_icon = {};
     }
 }
 
@@ -241,7 +264,7 @@ void AddTrayIcon(HWND hwnd) {
     g_tray_icon.uID = kTrayIconId;
     g_tray_icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_tray_icon.uCallbackMessage = kTrayCallbackMessage;
-    g_tray_icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    g_tray_icon.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_TRAY_ICON));
     wcscpy_s(g_tray_icon.szTip, L"Tourism Service Tray App");
 
     Shell_NotifyIconW(NIM_ADD, &g_tray_icon);
@@ -274,6 +297,7 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING, kMenuExit, L"Выход");
 
     SetForegroundWindow(hwnd);
+
     const UINT command = TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
@@ -367,11 +391,11 @@ bool RegisterMainWindowClass() {
     window_class.cbSize = sizeof(window_class);
     window_class.lpfnWndProc = WindowProc;
     window_class.hInstance = g_instance;
-    window_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    window_class.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_TRAY_ICON));
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     window_class.lpszClassName = kWindowClassName;
-    window_class.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
+    window_class.hIconSm = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_TRAY_ICON));
 
     return RegisterClassExW(&window_class) != 0;
 }

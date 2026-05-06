@@ -29,6 +29,7 @@ add_custom_target(generate_rpc_stubs
 add_executable(TrayWin32App WIN32
     src/main.cpp
     ${RPC_CLIENT}
+    resources/app.rc
 )
 
 add_executable(WitcherTrayService
