@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(RPC_IDL ${CMAKE_CURRENT_SOURCE_DIR}/rpc/WitcherControl.idl)
 set(MIDL_OUT ${CMAKE_CURRENT_BINARY_DIR}/generated/rpc)
 set(RPC_HEADER ${MIDL_OUT}/WitcherControl_h.h)
-set(RPC_IID ${MIDL_OUT}/WitcherControl_i.c)
+set(RPC_IID ${MIDL_OUT}/WitcherControl_iid.c)
 set(RPC_CLIENT ${MIDL_OUT}/WitcherControl_c.c)
 set(RPC_SERVER ${MIDL_OUT}/WitcherControl_s.c)
 
