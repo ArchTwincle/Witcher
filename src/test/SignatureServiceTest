@@ -1,0 +1,54 @@
+package com.example.tourism_service.service;
+
+import com.example.tourism_service.dto.Ticket;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+@SpringBootTest
+class SignatureServiceTest {
+
+    @Autowired
+    private SignatureService signatureService;
+
+    @Test
+    void shouldSignAndVerifyTicket() {
+        Ticket ticket = createTicket();
+
+        String signature = signatureService.signTicket(ticket);
+
+        assertNotNull(signature);
+        assertFalse(signature.isBlank());
+        assertTrue(signatureService.verifyTicket(ticket, signature));
+    }
+
+    @Test
+    void shouldFailVerificationIfTicketWasChanged() {
+        Ticket ticket = createTicket();
+
+        String signature = signatureService.signTicket(ticket);
+
+        ticket.setBlocked(true);
+
+        assertFalse(signatureService.verifyTicket(ticket, signature));
+    }
+
+    private Ticket createTicket() {
+        Ticket ticket = new Ticket();
+
+        ticket.setServerDate(LocalDateTime.of(2026, 4, 25, 12, 0));
+        ticket.setTicketLifetimeSeconds(3600L);
+        ticket.setActivationDate(LocalDate.of(2026, 4, 25));
+        ticket.setExpirationDate(LocalDate.of(2026, 5, 25));
+        ticket.setUserId(1L);
+        ticket.setDeviceId("AA-BB-CC-DD-EE-FF");
+        ticket.setBlocked(false);
+
+        return ticket;
+    }
+}
