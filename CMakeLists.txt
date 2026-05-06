@@ -4,6 +4,7 @@ project(TrayWin32App LANGUAGES CXX)
 
 add_executable(TrayWin32App WIN32
     src/main.cpp
+    resources/app.rc
 )
 
 target_compile_features(TrayWin32App PRIVATE cxx_std_17)

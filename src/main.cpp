@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <strsafe.h>
+#include "../resources/resource.h"
 
 namespace {
 
@@ -65,7 +66,7 @@ bool AddTrayIcon() {
     nid.uID = kTrayIconId;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = kWmTrayIcon;
-    nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    nid.hIcon = LoadIcon(g_instance, MAKEINTRESOURCE(IDI_TRAY_ICON));
     StringCchCopy(nid.szTip, ARRAYSIZE(nid.szTip), kAppTitle);
 
     const BOOL result = Shell_NotifyIcon(NIM_ADD, &nid);
