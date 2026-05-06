@@ -16,7 +16,7 @@ set(RPC_SERVER ${MIDL_OUT}/WitcherControl_s.c)
 add_custom_command(
     OUTPUT ${RPC_HEADER} ${RPC_CLIENT} ${RPC_SERVER}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${MIDL_OUT}
-    COMMAND midl /nologo /app_config /env x64 /char signed /h WitcherControl_h.h /client all /server all /out ${MIDL_OUT} ${RPC_IDL}
+    COMMAND midl /nologo /app_config /env x64 /char signed /h WitcherControl_h.h /out ${MIDL_OUT} ${RPC_IDL}}
     DEPENDS ${RPC_IDL}
     COMMENT "Generating Windows RPC stubs with MIDL"
     VERBATIM
