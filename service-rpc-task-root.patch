@@ -1,0 +1,1084 @@
+diff -ruN base/.github/workflows/windows-build.yml adapt/.github/workflows/windows-build.yml
+--- base/.github/workflows/windows-build.yml	2026-05-06 17:54:30.000000000 +0000
++++ adapt/.github/workflows/windows-build.yml	2026-05-06 18:56:22.767967729 +0000
+@@ -1,25 +1,34 @@
+-name: Windows build
++name: Windows Tray Service CI
+ 
+ on:
+   push:
++    branches: [ "main", "master" ]
+   pull_request:
++    branches: [ "main", "master" ]
+ 
+ jobs:
+-  build:
++  build-tray-suite:
+     runs-on: windows-latest
+ 
+     steps:
+-      - name: Checkout
++      - name: Checkout project
+         uses: actions/checkout@v4
+ 
+-      - name: Configure
++      - name: Configure CMake
+         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+ 
+-      - name: Build
++      - name: Build Release
+         run: cmake --build build --config Release
+ 
+-      - name: Upload exe artifact
++      - name: Collect artifacts
++        shell: powershell
++        run: |
++          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
++          Copy-Item build/Release/TrayWin32App.exe artifacts/TrayWin32App.exe
++          Copy-Item build/Release/WitcherTrayService.exe artifacts/WitcherTrayService.exe
++
++      - name: Upload Windows artifacts
+         uses: actions/upload-artifact@v4
+         with:
+-          name: TrayWin32App-windows-x64
+-          path: build/Release/TrayWin32App.exe
++          name: WitcherTraySuite-windows-x64
++          path: artifacts/*.exe
+diff -ruN base/CMakeLists.txt adapt/CMakeLists.txt
+--- base/CMakeLists.txt	2026-05-06 17:54:30.000000000 +0000
++++ adapt/CMakeLists.txt	2026-05-06 18:56:12.734207059 +0000
+@@ -1,14 +1,82 @@
+ cmake_minimum_required(VERSION 3.20)
+ 
+-project(TrayWin32App LANGUAGES CXX)
++project(WitcherTraySuite LANGUAGES C CXX)
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CXX_EXTENSIONS OFF)
++
++set(RPC_IDL ${CMAKE_CURRENT_SOURCE_DIR}/rpc/WitcherControl.idl)
++set(MIDL_OUT ${CMAKE_CURRENT_BINARY_DIR}/generated/rpc)
++set(RPC_HEADER ${MIDL_OUT}/WitcherControl_h.h)
++set(RPC_IID ${MIDL_OUT}/WitcherControl_i.c)
++set(RPC_CLIENT ${MIDL_OUT}/WitcherControl_c.c)
++set(RPC_SERVER ${MIDL_OUT}/WitcherControl_s.c)
++
++add_custom_command(
++    OUTPUT ${RPC_HEADER} ${RPC_IID} ${RPC_CLIENT} ${RPC_SERVER}
++    COMMAND ${CMAKE_COMMAND} -E make_directory ${MIDL_OUT}
++    COMMAND midl /nologo /env x64 /char signed /h WitcherControl_h.h /out ${MIDL_OUT} ${RPC_IDL}
++    DEPENDS ${RPC_IDL}
++    COMMENT "Generating Windows RPC stubs with MIDL"
++    VERBATIM
++)
++
++add_custom_target(generate_rpc_stubs DEPENDS ${RPC_HEADER} ${RPC_IID} ${RPC_CLIENT} ${RPC_SERVER})
+ 
+ add_executable(TrayWin32App WIN32
+     src/main.cpp
++    ${RPC_CLIENT}
++    ${RPC_IID}
++)
++
++add_executable(WitcherTrayService
++    src/service.cpp
++    ${RPC_SERVER}
++    ${RPC_IID}
++)
++
++add_dependencies(TrayWin32App generate_rpc_stubs)
++add_dependencies(WitcherTrayService generate_rpc_stubs)
++
++target_include_directories(TrayWin32App PRIVATE
++    include
++    ${MIDL_OUT}
+ )
+ 
+-target_compile_features(TrayWin32App PRIVATE cxx_std_17)
+-target_compile_definitions(TrayWin32App PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
++target_include_directories(WitcherTrayService PRIVATE
++    include
++    ${MIDL_OUT}
++)
++
++target_compile_definitions(TrayWin32App PRIVATE
++    UNICODE
++    _UNICODE
++    NOMINMAX
++)
++
++target_compile_definitions(WitcherTrayService PRIVATE
++    UNICODE
++    _UNICODE
++    NOMINMAX
++)
++
++target_link_libraries(TrayWin32App PRIVATE
++    advapi32
++    rpcrt4
++    shell32
++)
++
++target_link_libraries(WitcherTrayService PRIVATE
++    advapi32
++    rpcrt4
++    wtsapi32
++    userenv
++)
+ 
+-target_link_libraries(TrayWin32App PRIVATE user32 shell32 gdi32)
++if(MSVC)
++    target_compile_options(TrayWin32App PRIVATE /W4 /permissive-)
++    target_compile_options(WitcherTrayService PRIVATE /W4 /permissive-)
++endif()
+ 
+-install(TARGETS TrayWin32App RUNTIME DESTINATION .)
++install(TARGETS TrayWin32App WitcherTrayService RUNTIME DESTINATION .)
+diff -ruN base/include/common.h adapt/include/common.h
+--- base/include/common.h	1970-01-01 00:00:00.000000000 +0000
++++ adapt/include/common.h	2026-05-06 18:56:12.773603615 +0000
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <windows.h>
++
++namespace witcher {
++
++inline constexpr wchar_t kServiceName[] = L"WitcherTrayService";
++inline constexpr wchar_t kServiceDisplayName[] = L"Witcher Tray Service";
++inline constexpr wchar_t kTrayAppExeName[] = L"TrayWin32App.exe";
++inline constexpr wchar_t kServiceExeName[] = L"WitcherTrayService.exe";
++inline constexpr wchar_t kRpcEndpoint[] = L"WitcherTrayServiceRpc";
++
++} // namespace witcher
+diff -ruN base/rpc/WitcherControl.idl adapt/rpc/WitcherControl.idl
+--- base/rpc/WitcherControl.idl	1970-01-01 00:00:00.000000000 +0000
++++ adapt/rpc/WitcherControl.idl	2026-05-06 18:56:12.790968734 +0000
+@@ -0,0 +1,12 @@
++import "oaidl.idl";
++import "ocidl.idl";
++
++[
++    uuid(71F7A64D-4A71-4E3A-98B1-0DBE9E0B9D57),
++    version(1.0),
++    implicit_handle(handle_t WitcherControl_IfHandle)
++]
++interface WitcherControl
++{
++    void RpcStopService(void);
++}
+diff -ruN base/src/main.cpp adapt/src/main.cpp
+--- base/src/main.cpp	2026-05-06 17:54:30.000000000 +0000
++++ adapt/src/main.cpp	2026-05-06 18:56:12.809716559 +0000
+@@ -1,35 +1,222 @@
+ #include <windows.h>
+ #include <shellapi.h>
+-#include <strsafe.h>
++#include <tlhelp32.h>
++#include <rpc.h>
+ 
+-namespace {
++#include <algorithm>
++#include <filesystem>
++#include <string>
++
++#include "common.h"
++#include "WitcherControl_h.h"
+ 
+-constexpr wchar_t kWindowClassName[] = L"TrayWin32AppWindowClass";
+-constexpr wchar_t kAppTitle[] = L"Tray Win32 App";
+-constexpr wchar_t kMutexName[] = L"Local\\TrayWin32App_SingleInstanceMutex";
++#pragma comment(lib, "advapi32.lib")
++#pragma comment(lib, "rpcrt4.lib")
+ 
+-constexpr UINT kTrayIconId = 1;
+-constexpr UINT kWmTrayIcon = WM_APP + 1;
++handle_t WitcherControl_IfHandle = nullptr;
++
++namespace {
++
++constexpr wchar_t kWindowClassName[] = L"TourismServiceTrayWindowClass";
++constexpr wchar_t kWindowTitle[] = L"Tourism Service Tray App";
++constexpr wchar_t kMutexName[] = L"Local\\TourismServiceTrayApp.SingleInstance";
++constexpr UINT kTrayCallbackMessage = WM_APP + 1;
++constexpr UINT_PTR kTrayIconId = 1;
+ constexpr UINT kMenuOpen = 1001;
+ constexpr UINT kMenuExit = 1002;
+-constexpr UINT kMenuFileExit = 2001;
+ 
+ HINSTANCE g_instance = nullptr;
+ HWND g_main_window = nullptr;
+-HANDLE g_single_instance_mutex = nullptr;
++NOTIFYICONDATAW g_tray_icon{};
+ UINT g_taskbar_created_message = 0;
+-bool g_tray_icon_added = false;
++HANDLE g_single_instance_mutex = nullptr;
++bool g_is_exiting = false;
+ 
+-bool IsHiddenLaunch(int argc, wchar_t** argv) {
++std::wstring ToLower(std::wstring text) {
++    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
++        return static_cast<wchar_t>(towlower(ch));
++    });
++    return text;
++}
++
++bool HasArgument(const wchar_t* expected) {
++    int argc = 0;
++    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
++    if (!argv) {
++        return false;
++    }
++
++    bool found = false;
+     for (int i = 1; i < argc; ++i) {
+-        if (_wcsicmp(argv[i], L"--hidden") == 0 ||
+-            _wcsicmp(argv[i], L"/hidden") == 0 ||
+-            _wcsicmp(argv[i], L"--no-window") == 0 ||
+-            _wcsicmp(argv[i], L"/no-window") == 0) {
+-            return true;
++        if (_wcsicmp(argv[i], expected) == 0) {
++            found = true;
++            break;
+         }
+     }
+-    return false;
++
++    LocalFree(argv);
++    return found;
++}
++
++bool HasHiddenStartupArgument() {
++    return HasArgument(L"--hidden") || HasArgument(L"--no-window") || HasArgument(L"/hidden");
++}
++
++bool QueryServiceState(DWORD* state) {
++    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
++    if (!scm) {
++        return false;
++    }
++
++    SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
++    if (!service) {
++        CloseServiceHandle(scm);
++        return false;
++    }
++
++    SERVICE_STATUS_PROCESS status{};
++    DWORD bytes_needed = 0;
++    const BOOL ok = QueryServiceStatusEx(service,
++                                         SC_STATUS_PROCESS_INFO,
++                                         reinterpret_cast<LPBYTE>(&status),
++                                         sizeof(status),
++                                         &bytes_needed);
++    if (ok && state) {
++        *state = status.dwCurrentState;
++    }
++
++    CloseServiceHandle(service);
++    CloseServiceHandle(scm);
++    return ok != FALSE;
++}
++
++bool StartServiceAndWaitRunning() {
++    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
++    if (!scm) {
++        return false;
++    }
++
++    SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
++    if (!service) {
++        CloseServiceHandle(scm);
++        return false;
++    }
++
++    SERVICE_STATUS_PROCESS status{};
++    DWORD bytes_needed = 0;
++    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
++        CloseServiceHandle(service);
++        CloseServiceHandle(scm);
++        return false;
++    }
++
++    if (status.dwCurrentState == SERVICE_STOPPED) {
++        StartServiceW(service, 0, nullptr);
++    }
++
++    bool running = false;
++    for (int i = 0; i < 50; ++i) {
++        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
++            break;
++        }
++        if (status.dwCurrentState == SERVICE_RUNNING) {
++            running = true;
++            break;
++        }
++        Sleep(200);
++    }
++
++    CloseServiceHandle(service);
++    CloseServiceHandle(scm);
++    return running;
++}
++
++bool IsServiceStopped() {
++    DWORD state = 0;
++    return QueryServiceState(&state) && state == SERVICE_STOPPED;
++}
++
++DWORD GetParentProcessId() {
++    const DWORD current_pid = GetCurrentProcessId();
++    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++    if (snapshot == INVALID_HANDLE_VALUE) {
++        return 0;
++    }
++
++    PROCESSENTRY32W entry{};
++    entry.dwSize = sizeof(entry);
++    DWORD parent_pid = 0;
++    if (Process32FirstW(snapshot, &entry)) {
++        do {
++            if (entry.th32ProcessID == current_pid) {
++                parent_pid = entry.th32ParentProcessID;
++                break;
++            }
++        } while (Process32NextW(snapshot, &entry));
++    }
++
++    CloseHandle(snapshot);
++    return parent_pid;
++}
++
++std::wstring GetProcessImageBaseName(DWORD pid) {
++    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++    if (snapshot == INVALID_HANDLE_VALUE) {
++        return L"";
++    }
++
++    PROCESSENTRY32W entry{};
++    entry.dwSize = sizeof(entry);
++    std::wstring name;
++    if (Process32FirstW(snapshot, &entry)) {
++        do {
++            if (entry.th32ProcessID == pid) {
++                name = entry.szExeFile;
++                break;
++            }
++        } while (Process32NextW(snapshot, &entry));
++    }
++
++    CloseHandle(snapshot);
++    return name;
++}
++
++bool IsParentServiceProcess() {
++    const DWORD parent_pid = GetParentProcessId();
++    if (parent_pid == 0) {
++        return false;
++    }
++
++    const std::wstring parent_name = ToLower(GetProcessImageBaseName(parent_pid));
++    return parent_name == ToLower(witcher::kServiceExeName);
++}
++
++void RequestServiceStop() {
++    RPC_WSTR string_binding = nullptr;
++    RPC_STATUS status = RpcStringBindingComposeW(nullptr,
++                                                 reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
++                                                 nullptr,
++                                                 reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(witcher::kRpcEndpoint)),
++                                                 nullptr,
++                                                 &string_binding);
++    if (status != RPC_S_OK) {
++        return;
++    }
++
++    status = RpcBindingFromStringBindingW(string_binding, &WitcherControl_IfHandle);
++    RpcStringFreeW(&string_binding);
++    if (status != RPC_S_OK) {
++        return;
++    }
++
++    RpcTryExcept {
++        RpcStopService();
++    }
++    RpcExcept(1) {
++    }
++    RpcEndExcept
++
++    RpcBindingFree(&WitcherControl_IfHandle);
+ }
+ 
+ void ShowMainWindow() {
+@@ -42,156 +229,158 @@
+ }
+ 
+ void RemoveTrayIcon() {
+-    if (!g_tray_icon_added || !g_main_window) {
+-        return;
++    if (g_tray_icon.cbSize != 0) {
++        Shell_NotifyIconW(NIM_DELETE, &g_tray_icon);
+     }
+-
+-    NOTIFYICONDATA nid{};
+-    nid.cbSize = sizeof(nid);
+-    nid.hWnd = g_main_window;
+-    nid.uID = kTrayIconId;
+-    Shell_NotifyIcon(NIM_DELETE, &nid);
+-    g_tray_icon_added = false;
+ }
+ 
+-bool AddTrayIcon() {
+-    if (!g_main_window) {
+-        return false;
+-    }
+-
+-    NOTIFYICONDATA nid{};
+-    nid.cbSize = sizeof(nid);
+-    nid.hWnd = g_main_window;
+-    nid.uID = kTrayIconId;
+-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+-    nid.uCallbackMessage = kWmTrayIcon;
+-    nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+-    StringCchCopy(nid.szTip, ARRAYSIZE(nid.szTip), kAppTitle);
+-
+-    const BOOL result = Shell_NotifyIcon(NIM_ADD, &nid);
+-    if (result) {
+-        nid.uVersion = NOTIFYICON_VERSION_4;
+-        Shell_NotifyIcon(NIM_SETVERSION, &nid);
+-        g_tray_icon_added = true;
+-    }
+-
+-    return result == TRUE;
+-}
+-
+-void RecreateTrayIcon() {
+-    g_tray_icon_added = false;
+-    AddTrayIcon();
++void AddTrayIcon(HWND hwnd) {
++    g_tray_icon = {};
++    g_tray_icon.cbSize = sizeof(g_tray_icon);
++    g_tray_icon.hWnd = hwnd;
++    g_tray_icon.uID = kTrayIconId;
++    g_tray_icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
++    g_tray_icon.uCallbackMessage = kTrayCallbackMessage;
++    g_tray_icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
++    wcscpy_s(g_tray_icon.szTip, L"Tourism Service Tray App");
++
++    Shell_NotifyIconW(NIM_ADD, &g_tray_icon);
++    g_tray_icon.uVersion = NOTIFYICON_VERSION_4;
++    Shell_NotifyIconW(NIM_SETVERSION, &g_tray_icon);
+ }
+ 
+ void ExitApplication() {
++    g_is_exiting = true;
+     RemoveTrayIcon();
+-    DestroyWindow(g_main_window);
+     PostQuitMessage(0);
+ }
+ 
++void StopServiceAndExit() {
++    RequestServiceStop();
++    ExitApplication();
++}
++
+ void ShowTrayMenu(HWND hwnd) {
++    POINT cursor_position{};
++    GetCursorPos(&cursor_position);
++
+     HMENU menu = CreatePopupMenu();
+     if (!menu) {
+         return;
+     }
+ 
+-    AppendMenu(menu, MF_STRING, kMenuOpen, L"Открыть");
+-    AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
+-    AppendMenu(menu, MF_STRING, kMenuExit, L"Выход");
++    AppendMenuW(menu, MF_STRING, kMenuOpen, L"Открыть");
++    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
++    AppendMenuW(menu, MF_STRING, kMenuExit, L"Выход");
+ 
+-    POINT cursor{};
+-    GetCursorPos(&cursor);
+-
+-    // Required for proper menu dismissal when the user clicks outside it.
+     SetForegroundWindow(hwnd);
+-
+-    TrackPopupMenu(
++    const UINT command = TrackPopupMenu(
+         menu,
+-        TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
+-        cursor.x,
+-        cursor.y,
++        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
++        cursor_position.x,
++        cursor_position.y,
+         0,
+         hwnd,
+-        nullptr
+-    );
++        nullptr);
+ 
+     DestroyMenu(menu);
++
++    switch (command) {
++    case kMenuOpen:
++        ShowMainWindow();
++        break;
++    case kMenuExit:
++        StopServiceAndExit();
++        break;
++    default:
++        break;
++    }
+ }
+ 
+ HMENU CreateMainMenu() {
+     HMENU menu_bar = CreateMenu();
+     HMENU file_menu = CreatePopupMenu();
+ 
+-    AppendMenu(file_menu, MF_STRING, kMenuFileExit, L"Выход");
+-    AppendMenu(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"Файл");
++    AppendMenuW(file_menu, MF_STRING, kMenuExit, L"Выход");
++    AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"Файл");
+ 
+     return menu_bar;
+ }
+ 
+ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
+     if (message == g_taskbar_created_message) {
+-        RecreateTrayIcon();
++        AddTrayIcon(hwnd);
+         return 0;
+     }
+ 
+     switch (message) {
+-    case WM_COMMAND: {
+-        const UINT command = LOWORD(w_param);
+-        if (command == kMenuOpen) {
++    case WM_CREATE:
++        AddTrayIcon(hwnd);
++        return 0;
++
++    case kTrayCallbackMessage:
++        switch (LOWORD(l_param)) {
++        case WM_LBUTTONUP:
++        case NIN_SELECT:
++        case NIN_KEYSELECT:
+             ShowMainWindow();
+             return 0;
+-        }
+-        if (command == kMenuExit || command == kMenuFileExit) {
+-            ExitApplication();
++        case WM_RBUTTONUP:
++        case WM_CONTEXTMENU:
++            ShowTrayMenu(hwnd);
+             return 0;
+-        }
+-        break;
+-    }
+-
+-    case kWmTrayIcon:
+-        if (LOWORD(l_param) == WM_LBUTTONUP) {
+-            ShowMainWindow();
++        default:
+             return 0;
+         }
+-        if (LOWORD(l_param) == WM_RBUTTONUP || LOWORD(l_param) == WM_CONTEXTMENU) {
+-            ShowTrayMenu(hwnd);
++
++    case WM_COMMAND:
++        switch (LOWORD(w_param)) {
++        case kMenuExit:
++            StopServiceAndExit();
+             return 0;
++        default:
++            break;
+         }
+         break;
+ 
+     case WM_CLOSE:
+-        ShowWindow(hwnd, SW_HIDE);
+-        return 0;
++        if (!g_is_exiting) {
++            ShowWindow(hwnd, SW_HIDE);
++            return 0;
++        }
++        break;
+ 
+     case WM_DESTROY:
+         RemoveTrayIcon();
++        PostQuitMessage(0);
+         return 0;
+ 
+     default:
+         break;
+     }
+ 
+-    return DefWindowProc(hwnd, message, w_param, l_param);
++    return DefWindowProcW(hwnd, message, w_param, l_param);
+ }
+ 
+ bool RegisterMainWindowClass() {
+-    WNDCLASSEX wc{};
+-    wc.cbSize = sizeof(wc);
+-    wc.lpfnWndProc = WindowProc;
+-    wc.hInstance = g_instance;
+-    wc.lpszClassName = kWindowClassName;
+-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
++    WNDCLASSEXW window_class{};
++    window_class.cbSize = sizeof(window_class);
++    window_class.lpfnWndProc = WindowProc;
++    window_class.hInstance = g_instance;
++    window_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
++    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
++    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
++    window_class.lpszClassName = kWindowClassName;
++    window_class.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
+ 
+-    return RegisterClassEx(&wc) != 0;
++    return RegisterClassExW(&window_class) != 0;
+ }
+ 
+ HWND CreateMainWindow() {
+-    HWND hwnd = CreateWindowEx(
++    return CreateWindowExW(
+         0,
+         kWindowClassName,
+-        kAppTitle,
++        kWindowTitle,
+         WS_OVERLAPPEDWINDOW,
+         CW_USEDEFAULT,
+         CW_USEDEFAULT,
+@@ -200,18 +389,32 @@
+         nullptr,
+         CreateMainMenu(),
+         g_instance,
+-        nullptr
+-    );
+-
+-    return hwnd;
++        nullptr);
+ }
+ 
+ } // namespace
+ 
++extern "C" void* __RPC_USER midl_user_allocate(size_t size) {
++    return HeapAlloc(GetProcessHeap(), 0, size);
++}
++
++extern "C" void __RPC_USER midl_user_free(void* pointer) {
++    HeapFree(GetProcessHeap(), 0, pointer);
++}
++
+ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
+     g_instance = instance;
+ 
+-    g_single_instance_mutex = CreateMutex(nullptr, TRUE, kMutexName);
++    if (IsServiceStopped()) {
++        StartServiceAndWaitRunning();
++        return 0;
++    }
++
++    if (!IsParentServiceProcess()) {
++        return 0;
++    }
++
++    g_single_instance_mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+     if (!g_single_instance_mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+         if (g_single_instance_mutex) {
+             CloseHandle(g_single_instance_mutex);
+@@ -219,14 +422,7 @@
+         return 0;
+     }
+ 
+-    int argc = 0;
+-    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+-    const bool hidden_launch = argv ? IsHiddenLaunch(argc, argv) : false;
+-    if (argv) {
+-        LocalFree(argv);
+-    }
+-
+-    g_taskbar_created_message = RegisterWindowMessage(L"TaskbarCreated");
++    g_taskbar_created_message = RegisterWindowMessageW(L"TaskbarCreated");
+ 
+     if (!RegisterMainWindowClass()) {
+         CloseHandle(g_single_instance_mutex);
+@@ -239,28 +435,21 @@
+         return 1;
+     }
+ 
+-    if (!AddTrayIcon()) {
+-        DestroyWindow(g_main_window);
+-        CloseHandle(g_single_instance_mutex);
+-        return 1;
+-    }
+-
+-    if (!hidden_launch) {
++    if (!HasHiddenStartupArgument()) {
+         ShowWindow(g_main_window, show_command);
+         UpdateWindow(g_main_window);
+     }
+ 
+-    MSG msg{};
+-    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+-        TranslateMessage(&msg);
+-        DispatchMessage(&msg);
++    MSG message{};
++    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
++        TranslateMessage(&message);
++        DispatchMessageW(&message);
+     }
+ 
+     if (g_single_instance_mutex) {
+         ReleaseMutex(g_single_instance_mutex);
+         CloseHandle(g_single_instance_mutex);
+-        g_single_instance_mutex = nullptr;
+     }
+ 
+-    return static_cast<int>(msg.wParam);
++    return static_cast<int>(message.wParam);
+ }
+diff -ruN base/src/service.cpp adapt/src/service.cpp
+--- base/src/service.cpp	1970-01-01 00:00:00.000000000 +0000
++++ adapt/src/service.cpp	2026-05-06 18:56:12.828781669 +0000
+@@ -0,0 +1,336 @@
++#include <windows.h>
++#include <wtsapi32.h>
++#include <userenv.h>
++#include <rpc.h>
++
++#include <algorithm>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++#include "common.h"
++#include "WitcherControl_h.h"
++
++#pragma comment(lib, "advapi32.lib")
++#pragma comment(lib, "rpcrt4.lib")
++#pragma comment(lib, "wtsapi32.lib")
++#pragma comment(lib, "userenv.lib")
++
++namespace {
++
++SERVICE_STATUS_HANDLE g_status_handle = nullptr;
++SERVICE_STATUS g_status{};
++HANDLE g_stop_event = nullptr;
++CRITICAL_SECTION g_process_lock;
++std::vector<PROCESS_INFORMATION> g_children;
++
++void SetServiceStatusValue(DWORD state, DWORD win32_exit_code = NO_ERROR, DWORD wait_hint = 0) {
++    g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
++    g_status.dwCurrentState = state;
++    g_status.dwControlsAccepted = (state == SERVICE_RUNNING) ? SERVICE_ACCEPT_SESSIONCHANGE : 0;
++    g_status.dwWin32ExitCode = win32_exit_code;
++    g_status.dwServiceSpecificExitCode = 0;
++    g_status.dwCheckPoint = 0;
++    g_status.dwWaitHint = wait_hint;
++    SetServiceStatus(g_status_handle, &g_status);
++}
++
++std::filesystem::path GetModuleDirectory() {
++    wchar_t path[MAX_PATH]{};
++    GetModuleFileNameW(nullptr, path, MAX_PATH);
++    return std::filesystem::path(path).parent_path();
++}
++
++bool IsSessionAlreadyStarted(DWORD session_id) {
++    EnterCriticalSection(&g_process_lock);
++    for (auto it = g_children.begin(); it != g_children.end();) {
++        DWORD exit_code = 0;
++        if (GetExitCodeProcess(it->hProcess, &exit_code) && exit_code != STILL_ACTIVE) {
++            CloseHandle(it->hProcess);
++            CloseHandle(it->hThread);
++            it = g_children.erase(it);
++            continue;
++        }
++
++        DWORD child_session = 0;
++        if (ProcessIdToSessionId(it->dwProcessId, &child_session) && child_session == session_id) {
++            LeaveCriticalSection(&g_process_lock);
++            return true;
++        }
++        ++it;
++    }
++    LeaveCriticalSection(&g_process_lock);
++    return false;
++}
++
++bool LaunchTrayAppInSession(DWORD session_id) {
++    if (session_id == 0 || IsSessionAlreadyStarted(session_id)) {
++        return false;
++    }
++
++    HANDLE user_token = nullptr;
++    if (!WTSQueryUserToken(session_id, &user_token)) {
++        return false;
++    }
++
++    HANDLE primary_token = nullptr;
++    SECURITY_ATTRIBUTES token_attributes{};
++    token_attributes.nLength = sizeof(token_attributes);
++    if (!DuplicateTokenEx(user_token,
++                          TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
++                          &token_attributes,
++                          SecurityIdentification,
++                          TokenPrimary,
++                          &primary_token)) {
++        CloseHandle(user_token);
++        return false;
++    }
++    CloseHandle(user_token);
++
++    void* environment = nullptr;
++    CreateEnvironmentBlock(&environment, primary_token, FALSE);
++
++    auto app_path = GetModuleDirectory() / witcher::kTrayAppExeName;
++    std::wstring command_line = L"\"" + app_path.wstring() + L"\" --hidden --service-child";
++
++    STARTUPINFOW startup{};
++    startup.cb = sizeof(startup);
++    startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
++
++    PROCESS_INFORMATION process{};
++    DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT;
++    BOOL created = CreateProcessAsUserW(primary_token,
++                                        app_path.c_str(),
++                                        command_line.data(),
++                                        nullptr,
++                                        nullptr,
++                                        FALSE,
++                                        creation_flags,
++                                        environment,
++                                        GetModuleDirectory().c_str(),
++                                        &startup,
++                                        &process);
++
++    if (environment) {
++        DestroyEnvironmentBlock(environment);
++    }
++    CloseHandle(primary_token);
++
++    if (!created) {
++        return false;
++    }
++
++    EnterCriticalSection(&g_process_lock);
++    g_children.push_back(process);
++    LeaveCriticalSection(&g_process_lock);
++    return true;
++}
++
++void LaunchTrayAppsInExistingSessions() {
++    WTS_SESSION_INFOW* sessions = nullptr;
++    DWORD count = 0;
++    if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
++        return;
++    }
++
++    for (DWORD i = 0; i < count; ++i) {
++        const auto& session = sessions[i];
++        if (session.SessionId != 0 &&
++            (session.State == WTSActive || session.State == WTSConnected || session.State == WTSDisconnected)) {
++            LaunchTrayAppInSession(session.SessionId);
++        }
++    }
++
++    WTSFreeMemory(sessions);
++}
++
++void TerminateChildren() {
++    EnterCriticalSection(&g_process_lock);
++    for (auto& child : g_children) {
++        DWORD exit_code = 0;
++        if (GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == STILL_ACTIVE) {
++            TerminateProcess(child.hProcess, 0);
++            WaitForSingleObject(child.hProcess, 5000);
++        }
++        CloseHandle(child.hProcess);
++        CloseHandle(child.hThread);
++    }
++    g_children.clear();
++    LeaveCriticalSection(&g_process_lock);
++}
++
++DWORD WINAPI RpcServerThread(void*) {
++    RPC_STATUS status = RpcServerUseProtseqEpW(
++        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
++        RPC_C_PROTSEQ_MAX_REQS_DEFAULT,
++        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(witcher::kRpcEndpoint)),
++        nullptr);
++    if (status != RPC_S_OK && status != RPC_S_DUPLICATE_ENDPOINT) {
++        SetEvent(g_stop_event);
++        return status;
++    }
++
++    status = RpcServerRegisterIf2(WitcherControl_v1_0_s_ifspec,
++                                  nullptr,
++                                  nullptr,
++                                  RPC_IF_ALLOW_LOCAL_ONLY,
++                                  RPC_C_LISTEN_MAX_CALLS_DEFAULT,
++                                  static_cast<unsigned>(-1),
++                                  nullptr);
++    if (status != RPC_S_OK) {
++        SetEvent(g_stop_event);
++        return status;
++    }
++
++    status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, TRUE);
++    if (status != RPC_S_OK) {
++        SetEvent(g_stop_event);
++    }
++    return status;
++}
++
++DWORD WINAPI ServiceControlHandlerEx(DWORD control, DWORD event_type, void* event_data, void*) {
++    if (control == SERVICE_CONTROL_SESSIONCHANGE) {
++        if (event_type == WTS_SESSION_LOGON || event_type == WTS_SESSION_UNLOCK || event_type == WTS_CONSOLE_CONNECT ||
++            event_type == WTS_REMOTE_CONNECT) {
++            auto* notification = static_cast<WTSSESSION_NOTIFICATION*>(event_data);
++            if (notification && notification->dwSessionId != 0) {
++                LaunchTrayAppInSession(notification->dwSessionId);
++            }
++        }
++        return NO_ERROR;
++    }
++
++    // Stop and shutdown are intentionally not accepted by dwControlsAccepted.
++    return ERROR_CALL_NOT_IMPLEMENTED;
++}
++
++void WINAPI ServiceMain(DWORD, LPWSTR*) {
++    g_status_handle = RegisterServiceCtrlHandlerExW(witcher::kServiceName, ServiceControlHandlerEx, nullptr);
++    if (!g_status_handle) {
++        return;
++    }
++
++    SetServiceStatusValue(SERVICE_START_PENDING, NO_ERROR, 3000);
++
++    InitializeCriticalSection(&g_process_lock);
++    g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++    if (!g_stop_event) {
++        SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
++        DeleteCriticalSection(&g_process_lock);
++        return;
++    }
++
++    HANDLE rpc_thread = CreateThread(nullptr, 0, RpcServerThread, nullptr, 0, nullptr);
++    if (!rpc_thread) {
++        CloseHandle(g_stop_event);
++        SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
++        DeleteCriticalSection(&g_process_lock);
++        return;
++    }
++
++    LaunchTrayAppsInExistingSessions();
++    SetServiceStatusValue(SERVICE_RUNNING);
++
++    WaitForSingleObject(g_stop_event, INFINITE);
++
++    SetServiceStatusValue(SERVICE_STOP_PENDING, NO_ERROR, 5000);
++    RpcMgmtStopServerListening(nullptr);
++    WaitForSingleObject(rpc_thread, 5000);
++    RpcServerUnregisterIf(WitcherControl_v1_0_s_ifspec, nullptr, FALSE);
++    CloseHandle(rpc_thread);
++
++    TerminateChildren();
++    CloseHandle(g_stop_event);
++    DeleteCriticalSection(&g_process_lock);
++
++    SetServiceStatusValue(SERVICE_STOPPED);
++}
++
++bool InstallService() {
++    wchar_t module_path[MAX_PATH]{};
++    GetModuleFileNameW(nullptr, module_path, MAX_PATH);
++
++    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
++    if (!scm) {
++        return false;
++    }
++
++    SC_HANDLE service = CreateServiceW(scm,
++                                       witcher::kServiceName,
++                                       witcher::kServiceDisplayName,
++                                       SERVICE_ALL_ACCESS,
++                                       SERVICE_WIN32_OWN_PROCESS,
++                                       SERVICE_AUTO_START,
++                                       SERVICE_ERROR_NORMAL,
++                                       module_path,
++                                       nullptr,
++                                       nullptr,
++                                       nullptr,
++                                       nullptr,
++                                       nullptr);
++    if (!service && GetLastError() == ERROR_SERVICE_EXISTS) {
++        service = OpenServiceW(scm, witcher::kServiceName, SERVICE_CHANGE_CONFIG | SERVICE_START);
++    }
++
++    if (service) {
++        SERVICE_DESCRIPTIONW description{};
++        description.lpDescription = const_cast<LPWSTR>(L"Starts and controls the Witcher tray application in user sessions.");
++        ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description);
++        CloseServiceHandle(service);
++    }
++
++    CloseServiceHandle(scm);
++    return service != nullptr;
++}
++
++bool UninstallService() {
++    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
++    if (!scm) {
++        return false;
++    }
++    SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
++    if (!service) {
++        CloseServiceHandle(scm);
++        return false;
++    }
++    const bool result = DeleteService(service) != FALSE;
++    CloseServiceHandle(service);
++    CloseServiceHandle(scm);
++    return result;
++}
++
++} // namespace
++
++extern "C" void RpcStopService(void) {
++    if (g_stop_event) {
++        SetEvent(g_stop_event);
++    }
++}
++
++extern "C" void* __RPC_USER midl_user_allocate(size_t size) {
++    return HeapAlloc(GetProcessHeap(), 0, size);
++}
++
++extern "C" void __RPC_USER midl_user_free(void* pointer) {
++    HeapFree(GetProcessHeap(), 0, pointer);
++}
++
++int wmain(int argc, wchar_t* argv[]) {
++    if (argc > 1) {
++        const std::wstring arg = argv[1];
++        if (arg == L"--install") {
++            return InstallService() ? 0 : 1;
++        }
++        if (arg == L"--uninstall") {
++            return UninstallService() ? 0 : 1;
++        }
++    }
++
++    SERVICE_TABLE_ENTRYW service_table[] = {
++        {const_cast<LPWSTR>(witcher::kServiceName), ServiceMain},
++        {nullptr, nullptr}
++    };
++
++    return StartServiceCtrlDispatcherW(service_table) ? 0 : 1;
++}
