@@ -1,40 +1,16 @@
-HELP.md
-target/
-.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
-
-### STS ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
-
-### IntelliJ IDEA ###
-.idea
-*.iws
-*.iml
-*.ipr
-
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
+out/
 build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-
-### VS Code ###
+.vs/
 .vscode/
-
-### Keystores / signing keys ###
-src/main/resources/signing.p12
-src/main/resources/staviskiy_server.jks
+.idea/
+CMakeUserPresets.json
+*.user
+*.suo
+*.pdb
+*.ilk
+*.obj
+*.exe
+*.iml
 *.p12
 *.jks
 *.pfx
