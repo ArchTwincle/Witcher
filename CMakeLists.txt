@@ -8,32 +8,32 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(RPC_IDL ${CMAKE_CURRENT_SOURCE_DIR}/rpc/WitcherControl.idl)
 set(MIDL_OUT ${CMAKE_CURRENT_BINARY_DIR}/generated/rpc)
+
 set(RPC_HEADER ${MIDL_OUT}/WitcherControl_h.h)
-set(RPC_IID ${MIDL_OUT}/WitcherControl_iid.c)
 set(RPC_CLIENT ${MIDL_OUT}/WitcherControl_c.c)
 set(RPC_SERVER ${MIDL_OUT}/WitcherControl_s.c)
 
 add_custom_command(
-    OUTPUT ${RPC_HEADER} ${RPC_IID} ${RPC_CLIENT} ${RPC_SERVER}
+    OUTPUT ${RPC_HEADER} ${RPC_CLIENT} ${RPC_SERVER}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${MIDL_OUT}
-    COMMAND midl /nologo /app_config /env x64 /char signed /h WitcherControl_h.h /out ${MIDL_OUT} ${RPC_IDL}
+    COMMAND midl /nologo /app_config /env x64 /char signed /h WitcherControl_h.h /client all /server all /out ${MIDL_OUT} ${RPC_IDL}
     DEPENDS ${RPC_IDL}
     COMMENT "Generating Windows RPC stubs with MIDL"
     VERBATIM
 )
 
-add_custom_target(generate_rpc_stubs DEPENDS ${RPC_HEADER} ${RPC_IID} ${RPC_CLIENT} ${RPC_SERVER})
+add_custom_target(generate_rpc_stubs
+    DEPENDS ${RPC_HEADER} ${RPC_CLIENT} ${RPC_SERVER}
+)
 
 add_executable(TrayWin32App WIN32
     src/main.cpp
     ${RPC_CLIENT}
-    ${RPC_IID}
 )
 
 add_executable(WitcherTrayService
     src/service.cpp
     ${RPC_SERVER}
-    ${RPC_IID}
 )
 
 add_dependencies(TrayWin32App generate_rpc_stubs)
