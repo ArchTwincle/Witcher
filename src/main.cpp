@@ -181,7 +181,7 @@ bool RegisterMainWindowClass() {
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = g_instance;
     wc.lpszClassName = kWindowClassName;
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIcon(g_instance, MAKEINTRESOURCE(IDI_TRAY_ICON));
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
 
