@@ -1,0 +1,12 @@
+import "oaidl.idl";
+import "ocidl.idl";
+
+[
+    uuid(71F7A64D-4A71-4E3A-98B1-0DBE9E0B9D57),
+    version(1.0),
+    implicit_handle(handle_t WitcherControl_IfHandle)
+]
+interface WitcherControl
+{
+    void RpcStopService(void);
+}

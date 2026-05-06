@@ -1,35 +1,222 @@
 #include <windows.h>
 #include <shellapi.h>
-#include <strsafe.h>
+#include <tlhelp32.h>
+#include <rpc.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <string>
+
+#include "common.h"
+#include "WitcherControl_h.h"
+
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "rpcrt4.lib")
+
+handle_t WitcherControl_IfHandle = nullptr;
 
 namespace {
 
-constexpr wchar_t kWindowClassName[] = L"TrayWin32AppWindowClass";
-constexpr wchar_t kAppTitle[] = L"Tray Win32 App";
-constexpr wchar_t kMutexName[] = L"Local\\TrayWin32App_SingleInstanceMutex";
-
-constexpr UINT kTrayIconId = 1;
-constexpr UINT kWmTrayIcon = WM_APP + 1;
+constexpr wchar_t kWindowClassName[] = L"TourismServiceTrayWindowClass";
+constexpr wchar_t kWindowTitle[] = L"Tourism Service Tray App";
+constexpr wchar_t kMutexName[] = L"Local\\TourismServiceTrayApp.SingleInstance";
+constexpr UINT kTrayCallbackMessage = WM_APP + 1;
+constexpr UINT_PTR kTrayIconId = 1;
 constexpr UINT kMenuOpen = 1001;
 constexpr UINT kMenuExit = 1002;
-constexpr UINT kMenuFileExit = 2001;
 
 HINSTANCE g_instance = nullptr;
 HWND g_main_window = nullptr;
-HANDLE g_single_instance_mutex = nullptr;
+NOTIFYICONDATAW g_tray_icon{};
 UINT g_taskbar_created_message = 0;
-bool g_tray_icon_added = false;
+HANDLE g_single_instance_mutex = nullptr;
+bool g_is_exiting = false;
 
-bool IsHiddenLaunch(int argc, wchar_t** argv) {
+std::wstring ToLower(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towlower(ch));
+    });
+    return text;
+}
+
+bool HasArgument(const wchar_t* expected) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) {
+        return false;
+    }
+
+    bool found = false;
     for (int i = 1; i < argc; ++i) {
-        if (_wcsicmp(argv[i], L"--hidden") == 0 ||
-            _wcsicmp(argv[i], L"/hidden") == 0 ||
-            _wcsicmp(argv[i], L"--no-window") == 0 ||
-            _wcsicmp(argv[i], L"/no-window") == 0) {
-            return true;
+        if (_wcsicmp(argv[i], expected) == 0) {
+            found = true;
+            break;
         }
     }
-    return false;
+
+    LocalFree(argv);
+    return found;
+}
+
+bool HasHiddenStartupArgument() {
+    return HasArgument(L"--hidden") || HasArgument(L"--no-window") || HasArgument(L"/hidden");
+}
+
+bool QueryServiceState(DWORD* state) {
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) {
+        return false;
+    }
+
+    SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!service) {
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytes_needed = 0;
+    const BOOL ok = QueryServiceStatusEx(service,
+                                         SC_STATUS_PROCESS_INFO,
+                                         reinterpret_cast<LPBYTE>(&status),
+                                         sizeof(status),
+                                         &bytes_needed);
+    if (ok && state) {
+        *state = status.dwCurrentState;
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    return ok != FALSE;
+}
+
+bool StartServiceAndWaitRunning() {
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) {
+        return false;
+    }
+
+    SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!service) {
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytes_needed = 0;
+    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    if (status.dwCurrentState == SERVICE_STOPPED) {
+        StartServiceW(service, 0, nullptr);
+    }
+
+    bool running = false;
+    for (int i = 0; i < 50; ++i) {
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
+            break;
+        }
+        if (status.dwCurrentState == SERVICE_RUNNING) {
+            running = true;
+            break;
+        }
+        Sleep(200);
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    return running;
+}
+
+bool IsServiceStopped() {
+    DWORD state = 0;
+    return QueryServiceState(&state) && state == SERVICE_STOPPED;
+}
+
+DWORD GetParentProcessId() {
+    const DWORD current_pid = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    DWORD parent_pid = 0;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == current_pid) {
+                parent_pid = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return parent_pid;
+}
+
+std::wstring GetProcessImageBaseName(DWORD pid) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return L"";
+    }
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    std::wstring name;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == pid) {
+                name = entry.szExeFile;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return name;
+}
+
+bool IsParentServiceProcess() {
+    const DWORD parent_pid = GetParentProcessId();
+    if (parent_pid == 0) {
+        return false;
+    }
+
+    const std::wstring parent_name = ToLower(GetProcessImageBaseName(parent_pid));
+    return parent_name == ToLower(witcher::kServiceExeName);
+}
+
+void RequestServiceStop() {
+    RPC_WSTR string_binding = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(nullptr,
+                                                 reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
+                                                 nullptr,
+                                                 reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(witcher::kRpcEndpoint)),
+                                                 nullptr,
+                                                 &string_binding);
+    if (status != RPC_S_OK) {
+        return;
+    }
+
+    status = RpcBindingFromStringBindingW(string_binding, &WitcherControl_IfHandle);
+    RpcStringFreeW(&string_binding);
+    if (status != RPC_S_OK) {
+        return;
+    }
+
+    RpcTryExcept {
+        RpcStopService();
+    }
+    RpcExcept(1) {
+    }
+    RpcEndExcept
+
+    RpcBindingFree(&WitcherControl_IfHandle);
 }
 
 void ShowMainWindow() {
@@ -42,156 +229,158 @@ void ShowMainWindow() {
 }
 
 void RemoveTrayIcon() {
-    if (!g_tray_icon_added || !g_main_window) {
-        return;
+    if (g_tray_icon.cbSize != 0) {
+        Shell_NotifyIconW(NIM_DELETE, &g_tray_icon);
     }
-
-    NOTIFYICONDATA nid{};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_main_window;
-    nid.uID = kTrayIconId;
-    Shell_NotifyIcon(NIM_DELETE, &nid);
-    g_tray_icon_added = false;
 }
 
-bool AddTrayIcon() {
-    if (!g_main_window) {
-        return false;
-    }
+void AddTrayIcon(HWND hwnd) {
+    g_tray_icon = {};
+    g_tray_icon.cbSize = sizeof(g_tray_icon);
+    g_tray_icon.hWnd = hwnd;
+    g_tray_icon.uID = kTrayIconId;
+    g_tray_icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_tray_icon.uCallbackMessage = kTrayCallbackMessage;
+    g_tray_icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(g_tray_icon.szTip, L"Tourism Service Tray App");
 
-    NOTIFYICONDATA nid{};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_main_window;
-    nid.uID = kTrayIconId;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = kWmTrayIcon;
-    nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    StringCchCopy(nid.szTip, ARRAYSIZE(nid.szTip), kAppTitle);
-
-    const BOOL result = Shell_NotifyIcon(NIM_ADD, &nid);
-    if (result) {
-        nid.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIcon(NIM_SETVERSION, &nid);
-        g_tray_icon_added = true;
-    }
-
-    return result == TRUE;
-}
-
-void RecreateTrayIcon() {
-    g_tray_icon_added = false;
-    AddTrayIcon();
+    Shell_NotifyIconW(NIM_ADD, &g_tray_icon);
+    g_tray_icon.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &g_tray_icon);
 }
 
 void ExitApplication() {
+    g_is_exiting = true;
     RemoveTrayIcon();
-    DestroyWindow(g_main_window);
     PostQuitMessage(0);
 }
 
+void StopServiceAndExit() {
+    RequestServiceStop();
+    ExitApplication();
+}
+
 void ShowTrayMenu(HWND hwnd) {
+    POINT cursor_position{};
+    GetCursorPos(&cursor_position);
+
     HMENU menu = CreatePopupMenu();
     if (!menu) {
         return;
     }
 
-    AppendMenu(menu, MF_STRING, kMenuOpen, L"Открыть");
-    AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenu(menu, MF_STRING, kMenuExit, L"Выход");
+    AppendMenuW(menu, MF_STRING, kMenuOpen, L"Открыть");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kMenuExit, L"Выход");
 
-    POINT cursor{};
-    GetCursorPos(&cursor);
-
-    // Required for proper menu dismissal when the user clicks outside it.
     SetForegroundWindow(hwnd);
-
-    TrackPopupMenu(
+    const UINT command = TrackPopupMenu(
         menu,
-        TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-        cursor.x,
-        cursor.y,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+        cursor_position.x,
+        cursor_position.y,
         0,
         hwnd,
-        nullptr
-    );
+        nullptr);
 
     DestroyMenu(menu);
+
+    switch (command) {
+    case kMenuOpen:
+        ShowMainWindow();
+        break;
+    case kMenuExit:
+        StopServiceAndExit();
+        break;
+    default:
+        break;
+    }
 }
 
 HMENU CreateMainMenu() {
     HMENU menu_bar = CreateMenu();
     HMENU file_menu = CreatePopupMenu();
 
-    AppendMenu(file_menu, MF_STRING, kMenuFileExit, L"Выход");
-    AppendMenu(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"Файл");
+    AppendMenuW(file_menu, MF_STRING, kMenuExit, L"Выход");
+    AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"Файл");
 
     return menu_bar;
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
     if (message == g_taskbar_created_message) {
-        RecreateTrayIcon();
+        AddTrayIcon(hwnd);
         return 0;
     }
 
     switch (message) {
-    case WM_COMMAND: {
-        const UINT command = LOWORD(w_param);
-        if (command == kMenuOpen) {
-            ShowMainWindow();
-            return 0;
-        }
-        if (command == kMenuExit || command == kMenuFileExit) {
-            ExitApplication();
-            return 0;
-        }
-        break;
-    }
+    case WM_CREATE:
+        AddTrayIcon(hwnd);
+        return 0;
 
-    case kWmTrayIcon:
-        if (LOWORD(l_param) == WM_LBUTTONUP) {
+    case kTrayCallbackMessage:
+        switch (LOWORD(l_param)) {
+        case WM_LBUTTONUP:
+        case NIN_SELECT:
+        case NIN_KEYSELECT:
             ShowMainWindow();
             return 0;
-        }
-        if (LOWORD(l_param) == WM_RBUTTONUP || LOWORD(l_param) == WM_CONTEXTMENU) {
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
             ShowTrayMenu(hwnd);
             return 0;
+        default:
+            return 0;
+        }
+
+    case WM_COMMAND:
+        switch (LOWORD(w_param)) {
+        case kMenuExit:
+            StopServiceAndExit();
+            return 0;
+        default:
+            break;
         }
         break;
 
     case WM_CLOSE:
-        ShowWindow(hwnd, SW_HIDE);
-        return 0;
+        if (!g_is_exiting) {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+        break;
 
     case WM_DESTROY:
         RemoveTrayIcon();
+        PostQuitMessage(0);
         return 0;
 
     default:
         break;
     }
 
-    return DefWindowProc(hwnd, message, w_param, l_param);
+    return DefWindowProcW(hwnd, message, w_param, l_param);
 }
 
 bool RegisterMainWindowClass() {
-    WNDCLASSEX wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = WindowProc;
-    wc.hInstance = g_instance;
-    wc.lpszClassName = kWindowClassName;
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    WNDCLASSEXW window_class{};
+    window_class.cbSize = sizeof(window_class);
+    window_class.lpfnWndProc = WindowProc;
+    window_class.hInstance = g_instance;
+    window_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    window_class.lpszClassName = kWindowClassName;
+    window_class.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
 
-    return RegisterClassEx(&wc) != 0;
+    return RegisterClassExW(&window_class) != 0;
 }
 
 HWND CreateMainWindow() {
-    HWND hwnd = CreateWindowEx(
+    return CreateWindowExW(
         0,
         kWindowClassName,
-        kAppTitle,
+        kWindowTitle,
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -200,18 +389,32 @@ HWND CreateMainWindow() {
         nullptr,
         CreateMainMenu(),
         g_instance,
-        nullptr
-    );
-
-    return hwnd;
+        nullptr);
 }
 
 } // namespace
 
+extern "C" void* __RPC_USER midl_user_allocate(size_t size) {
+    return HeapAlloc(GetProcessHeap(), 0, size);
+}
+
+extern "C" void __RPC_USER midl_user_free(void* pointer) {
+    HeapFree(GetProcessHeap(), 0, pointer);
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     g_instance = instance;
 
-    g_single_instance_mutex = CreateMutex(nullptr, TRUE, kMutexName);
+    if (IsServiceStopped()) {
+        StartServiceAndWaitRunning();
+        return 0;
+    }
+
+    if (!IsParentServiceProcess()) {
+        return 0;
+    }
+
+    g_single_instance_mutex = CreateMutexW(nullptr, TRUE, kMutexName);
     if (!g_single_instance_mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (g_single_instance_mutex) {
             CloseHandle(g_single_instance_mutex);
@@ -219,14 +422,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         return 0;
     }
 
-    int argc = 0;
-    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    const bool hidden_launch = argv ? IsHiddenLaunch(argc, argv) : false;
-    if (argv) {
-        LocalFree(argv);
-    }
-
-    g_taskbar_created_message = RegisterWindowMessage(L"TaskbarCreated");
+    g_taskbar_created_message = RegisterWindowMessageW(L"TaskbarCreated");
 
     if (!RegisterMainWindowClass()) {
         CloseHandle(g_single_instance_mutex);
@@ -239,28 +435,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         return 1;
     }
 
-    if (!AddTrayIcon()) {
-        DestroyWindow(g_main_window);
-        CloseHandle(g_single_instance_mutex);
-        return 1;
-    }
-
-    if (!hidden_launch) {
+    if (!HasHiddenStartupArgument()) {
         ShowWindow(g_main_window, show_command);
         UpdateWindow(g_main_window);
     }
 
-    MSG msg{};
-    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
     }
 
     if (g_single_instance_mutex) {
         ReleaseMutex(g_single_instance_mutex);
         CloseHandle(g_single_instance_mutex);
-        g_single_instance_mutex = nullptr;
     }
 
-    return static_cast<int>(msg.wParam);
+    return static_cast<int>(message.wParam);
 }
