@@ -292,9 +292,10 @@ void ShowTrayMenu(HWND hwnd) {
         return;
     }
 
-    AppendMenuW(menu, MF_STRING, kMenuOpen, L"Открыть");
+    AppendMenuW(menu, MF_STRING, kMenuOpen, L"\u041E\u0442\u043A\u0440\u044B\u0442\u044C");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuExit, L"Выход");
+    AppendMenuW(menu, MF_STRING, kMenuExit, L"\u0412\u044B\u0445\u043E\u0434");
+
 
     SetForegroundWindow(hwnd);
 
@@ -325,8 +326,8 @@ HMENU CreateMainMenu() {
     HMENU menu_bar = CreateMenu();
     HMENU file_menu = CreatePopupMenu();
 
-    AppendMenuW(file_menu, MF_STRING, kMenuExit, L"Выход");
-    AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"Файл");
+    AppendMenuW(file_menu, MF_STRING, kMenuExit, L"\u0412\u044B\u0445\u043E\u0434");
+    AppendMenuW(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"\u0424\u0430\u0439\u043B");
 
     return menu_bar;
 }
