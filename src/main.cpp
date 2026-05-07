@@ -87,9 +87,9 @@ namespace {
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
 
-        AppendMenu(menu, MF_STRING, kMenuOpen, L"Открыть");
+        AppendMenu(menu, MF_STRING, kMenuOpen, L"\u041E\u0442\u043A\u0440\u044B\u0442\u044C");
         AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenu(menu, MF_STRING, kMenuExit, L"Выход");
+        AppendMenu(menu, MF_STRING, kMenuExit, L"\u0412\u044B\u0445\u043E\u0434");
 
         POINT cursor{};
         GetCursorPos(&cursor);
@@ -113,8 +113,8 @@ namespace {
         HMENU menu_bar = CreateMenu();
         HMENU file_menu = CreatePopupMenu();
 
-        AppendMenu(file_menu, MF_STRING, kMenuFileExit, L"Выход");
-        AppendMenu(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"Файл");
+        AppendMenu(file_menu, MF_STRING, kMenuFileExit, L"\u0412\u044B\u0445\u043E\u0434");
+        AppendMenu(menu_bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"\u0424\u0430\u0439\u043B");
 
         return menu_bar;
     }
