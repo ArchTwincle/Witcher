@@ -13,10 +13,16 @@ set(RPC_HEADER ${MIDL_OUT}/WitcherControl_h.h)
 set(RPC_CLIENT ${MIDL_OUT}/WitcherControl_c.c)
 set(RPC_SERVER ${MIDL_OUT}/WitcherControl_s.c)
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(MIDL_ENV x64)
+else()
+    set(MIDL_ENV win32)
+endif()
+
 add_custom_command(
     OUTPUT ${RPC_HEADER} ${RPC_CLIENT} ${RPC_SERVER}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${MIDL_OUT}
-    COMMAND midl /nologo /app_config /env x64 /char signed /h WitcherControl_h.h /out ${MIDL_OUT} ${RPC_IDL}
+    COMMAND midl /nologo /app_config /env ${MIDL_ENV} /char signed /h WitcherControl_h.h /out ${MIDL_OUT} ${RPC_IDL}
     DEPENDS ${RPC_IDL}
     COMMENT "Generating Windows RPC stubs with MIDL"
     VERBATIM
