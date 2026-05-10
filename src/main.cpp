@@ -275,7 +275,16 @@ namespace {
 
     void StopServiceAndExit() {
         RequestServiceStop();
-        ExitApplication();
+
+        /*
+            Do not close the GUI immediately.
+
+            If the user confirms the service stop, the service will terminate
+            all launched TrayWin32App.exe processes in TerminateChildren().
+
+            If the user clicks No or the confirmation cannot be shown,
+            the tray app remains running.
+        */
     }
 
     void ShowTrayMenu(HWND hwnd) {
@@ -484,7 +493,6 @@ extern "C" void* __RPC_USER midl_user_allocate(size_t size) {
 extern "C" void __RPC_USER midl_user_free(void* pointer) {
     HeapFree(GetProcessHeap(), 0, pointer);
 }
-
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     g_instance = instance;

@@ -2,10 +2,13 @@
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <rpc.h>
+#include <aclapi.h>
+#include <sddl.h>
 
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <cwchar>
 
 #include "common.h"
 #include "WitcherControl_h.h"
@@ -33,6 +36,161 @@ namespace {
         g_status.dwWaitHint = wait_hint;
 
         SetServiceStatus(g_status_handle, &g_status);
+    }
+
+    bool GetActiveUserSessionId(DWORD* session_id) {
+        if (!session_id) {
+            return false;
+        }
+
+        *session_id = 0;
+
+        WTS_SESSION_INFOW* sessions = nullptr;
+        DWORD count = 0;
+
+        if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
+            for (DWORD i = 0; i < count; ++i) {
+                if (sessions[i].SessionId != 0 && sessions[i].State == WTSActive) {
+                    *session_id = sessions[i].SessionId;
+                    WTSFreeMemory(sessions);
+                    return true;
+                }
+            }
+
+            WTSFreeMemory(sessions);
+        }
+
+        DWORD console_session_id = WTSGetActiveConsoleSessionId();
+
+        if (console_session_id != 0xFFFFFFFF && console_session_id != 0) {
+            *session_id = console_session_id;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool ConfirmServiceStopWithActiveUser() {
+        DWORD active_session_id = 0;
+
+        if (!GetActiveUserSessionId(&active_session_id)) {
+            return false;
+        }
+
+        wchar_t title[] = L"WitcherTrayService";
+        wchar_t message[] = L"Stop WitcherTrayService and close all tray applications?";
+
+        DWORD response = IDNO;
+
+        BOOL sent = WTSSendMessageW(
+            WTS_CURRENT_SERVER_HANDLE,
+            active_session_id,
+            title,
+            static_cast<DWORD>((wcslen(title) + 1) * sizeof(wchar_t)),
+            message,
+            static_cast<DWORD>((wcslen(message) + 1) * sizeof(wchar_t)),
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
+            30,
+            &response,
+            TRUE
+        );
+
+        if (!sent) {
+            return false;
+        }
+
+        return response == IDYES;
+    }
+
+    bool ConfigureProcessDacl(HANDLE process_handle) {
+        if (!process_handle) {
+            return false;
+        }
+
+        /*
+            Best-effort process protection.
+
+            SYSTEM gets full access.
+            Administrators / Users / Authenticated Users get limited read/sync rights.
+            PROCESS_TERMINATE is intentionally not granted.
+
+            Full protection against elevated administrators is not guaranteed in user mode:
+            an elevated administrator can use SeDebugPrivilege, change ownership/DACL,
+            or use kernel-level tools. This implementation protects against normal
+            non-admin termination attempts and limits terminate access by DACL.
+        */
+        constexpr wchar_t kProcessSecurityDescriptor[] =
+            L"D:P"
+            L"(A;;GA;;;SY)"
+            L"(A;;0x00121000;;;BA)"
+            L"(A;;0x00121000;;;BU)"
+            L"(A;;0x00121000;;;AU)";
+
+        PSECURITY_DESCRIPTOR security_descriptor = nullptr;
+
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            kProcessSecurityDescriptor,
+            SDDL_REVISION_1,
+            &security_descriptor,
+            nullptr
+        )) {
+            return false;
+        }
+
+        PACL dacl = nullptr;
+        BOOL dacl_present = FALSE;
+        BOOL dacl_defaulted = FALSE;
+
+        if (!GetSecurityDescriptorDacl(
+            security_descriptor,
+            &dacl_present,
+            &dacl,
+            &dacl_defaulted
+        )) {
+            LocalFree(security_descriptor);
+            return false;
+        }
+
+        if (!dacl_present || !dacl) {
+            LocalFree(security_descriptor);
+            return false;
+        }
+
+        DWORD result = SetSecurityInfo(
+            process_handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            nullptr,
+            nullptr,
+            dacl,
+            nullptr
+        );
+
+        LocalFree(security_descriptor);
+
+        return result == ERROR_SUCCESS;
+    }
+
+    bool ConfigureCurrentProcessDacl() {
+        HANDLE process_handle = OpenProcess(
+            WRITE_DAC | READ_CONTROL,
+            FALSE,
+            GetCurrentProcessId()
+        );
+
+        if (!process_handle) {
+            return false;
+        }
+
+        bool result = ConfigureProcessDacl(process_handle);
+
+        CloseHandle(process_handle);
+
+        return result;
+    }
+
+    bool ConfigureChildProcessDacl(HANDLE child_process_handle) {
+        return ConfigureProcessDacl(child_process_handle);
     }
 
     std::filesystem::path GetModuleDirectory() {
@@ -132,6 +290,8 @@ namespace {
         if (!created) {
             return false;
         }
+
+        ConfigureChildProcessDacl(process.hProcess);
 
         EnterCriticalSection(&g_process_lock);
         g_children.push_back(process);
@@ -243,6 +403,8 @@ namespace {
 
         SetServiceStatusValue(SERVICE_START_PENDING, NO_ERROR, 3000);
 
+        ConfigureCurrentProcessDacl();
+
         InitializeCriticalSection(&g_process_lock);
 
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -342,10 +504,17 @@ namespace {
     }
 
 } // namespace
+
 extern "C" void RpcStopService(void) {
-    if (g_stop_event) {
-        SetEvent(g_stop_event);
+    if (!g_stop_event) {
+        return;
     }
+
+    if (!ConfirmServiceStopWithActiveUser()) {
+        return;
+    }
+
+    SetEvent(g_stop_event);
 }
 
 extern "C" void* __RPC_USER midl_user_allocate(size_t size) {
