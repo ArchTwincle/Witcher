@@ -68,7 +68,7 @@ namespace {
     std::wstring ToLower(std::wstring text) {
         std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
             return static_cast<wchar_t>(towlower(ch));
-            });
+        });
 
         return text;
     }
@@ -92,6 +92,68 @@ namespace {
 
         LocalFree(argv);
         return found;
+    }
+
+    int RunSecureStopConfirmation() {
+        HDESK original_desktop = OpenInputDesktop(
+            0,
+            FALSE,
+            DESKTOP_SWITCHDESKTOP | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS
+        );
+
+        HDESK confirm_desktop = CreateDesktopW(
+            L"WitcherStopConfirmationDesktop",
+            nullptr,
+            nullptr,
+            0,
+            GENERIC_ALL,
+            nullptr
+        );
+
+        if (!confirm_desktop) {
+            int fallback_result = MessageBoxW(
+                nullptr,
+                L"Stop WitcherTrayService and close all tray applications?",
+                L"WitcherTrayService",
+                MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
+            );
+
+            if (original_desktop) {
+                CloseDesktop(original_desktop);
+            }
+
+            return fallback_result == IDYES ? 0 : 1;
+        }
+
+        bool switched_to_confirm = SwitchDesktop(confirm_desktop) != FALSE;
+        bool thread_desktop_set = SetThreadDesktop(confirm_desktop) != FALSE;
+
+        int result = IDNO;
+
+        if (switched_to_confirm && thread_desktop_set) {
+            result = MessageBoxW(
+                nullptr,
+                L"Stop WitcherTrayService and close all tray applications?",
+                L"WitcherTrayService",
+                MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
+            );
+        }
+
+        if (original_desktop) {
+            SwitchDesktop(original_desktop);
+        }
+
+        CloseDesktop(confirm_desktop);
+
+        if (original_desktop) {
+            CloseDesktop(original_desktop);
+        }
+
+        if (!switched_to_confirm || !thread_desktop_set) {
+            return 1;
+        }
+
+        return result == IDYES ? 0 : 1;
     }
 
     bool HasHiddenStartupArgument() {
@@ -844,7 +906,15 @@ namespace {
     void StopServiceAndExit() {
         RequestServiceStop();
 
-    
+        /*
+            Do not close the GUI immediately.
+
+            If the user confirms service stop on the private desktop,
+            the service will terminate all launched TrayWin32App.exe processes.
+
+            If the user clicks No or the confirmation cannot be shown,
+            the tray app remains running.
+        */
     }
 
     void ShowTrayMenu(HWND hwnd) {
@@ -1065,6 +1135,10 @@ extern "C" void __RPC_USER midl_user_free(void* pointer) {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     g_instance = instance;
+
+    if (HasArgument(L"--secure-stop-confirm")) {
+        return RunSecureStopConfirmation();
+    }
 
     if (IsServiceStopped()) {
         StartServiceAndWaitRunning();

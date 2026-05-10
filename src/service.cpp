@@ -9,7 +9,6 @@
 #include <string>
 #include <vector>
 #include <ctime>
-#include <cwchar>
 
 #include "common.h"
 #include "WitcherControl_h.h"
@@ -86,54 +85,11 @@ namespace {
         return false;
     }
 
-    bool ConfirmServiceStopWithActiveUser() {
-        DWORD active_session_id = 0;
-
-        if (!GetActiveUserSessionId(&active_session_id)) {
-            return false;
-        }
-
-        wchar_t title[] = L"WitcherTrayService";
-        wchar_t message[] = L"Stop WitcherTrayService and close all tray applications?";
-
-        DWORD response = IDNO;
-
-        BOOL sent = WTSSendMessageW(
-            WTS_CURRENT_SERVER_HANDLE,
-            active_session_id,
-            title,
-            static_cast<DWORD>((wcslen(title) + 1) * sizeof(wchar_t)),
-            message,
-            static_cast<DWORD>((wcslen(message) + 1) * sizeof(wchar_t)),
-            MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
-            30,
-            &response,
-            TRUE
-        );
-
-        if (!sent) {
-            return false;
-        }
-
-        return response == IDYES;
-    }
-
     bool ConfigureProcessDacl(HANDLE process_handle) {
         if (!process_handle) {
             return false;
         }
 
-        //
-        // DACL для защиты процесса от завершения обычным пользователем.
-        //
-        // SYSTEM получает полный доступ.
-        // Administrators / Users / Authenticated Users получают только чтение/синхронизацию.
-        // PROCESS_TERMINATE намеренно не выдаётся.
-        //
-        // Полностью защититься от администратора в user-mode нельзя:
-        // администратор может включить SeDebugPrivilege, сменить владельца/DACL
-        // или использовать kernel-level средства. Это best-effort защита без драйвера.
-        //
         constexpr wchar_t kProcessSecurityDescriptor[] =
             L"D:P"
             L"(A;;GA;;;SY)"
@@ -212,6 +168,93 @@ namespace {
         wchar_t path[MAX_PATH]{};
         GetModuleFileNameW(nullptr, path, MAX_PATH);
         return std::filesystem::path(path).parent_path();
+    }
+
+    bool ConfirmServiceStopWithActiveUser() {
+        DWORD active_session_id = 0;
+
+        if (!GetActiveUserSessionId(&active_session_id)) {
+            return false;
+        }
+
+        HANDLE user_token = nullptr;
+
+        if (!WTSQueryUserToken(active_session_id, &user_token)) {
+            return false;
+        }
+
+        HANDLE primary_token = nullptr;
+
+        SECURITY_ATTRIBUTES token_attributes{};
+        token_attributes.nLength = sizeof(token_attributes);
+
+        if (!DuplicateTokenEx(
+            user_token,
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+            &token_attributes,
+            SecurityIdentification,
+            TokenPrimary,
+            &primary_token
+        )) {
+            CloseHandle(user_token);
+            return false;
+        }
+
+        CloseHandle(user_token);
+
+        void* environment = nullptr;
+        CreateEnvironmentBlock(&environment, primary_token, FALSE);
+
+        const auto module_directory = GetModuleDirectory();
+        const auto app_path = module_directory / witcher::kTrayAppExeName;
+
+        std::wstring command_line =
+            L"\"" + app_path.wstring() + L"\" --secure-stop-confirm";
+
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+
+        PROCESS_INFORMATION process{};
+
+        BOOL created = CreateProcessAsUserW(
+            primary_token,
+            app_path.c_str(),
+            command_line.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_UNICODE_ENVIRONMENT,
+            environment,
+            module_directory.c_str(),
+            &startup,
+            &process
+        );
+
+        if (environment) {
+            DestroyEnvironmentBlock(environment);
+        }
+
+        CloseHandle(primary_token);
+
+        if (!created) {
+            return false;
+        }
+
+        DWORD wait_result = WaitForSingleObject(process.hProcess, 30000);
+
+        if (wait_result == WAIT_TIMEOUT) {
+            TerminateProcess(process.hProcess, 1);
+            WaitForSingleObject(process.hProcess, 3000);
+        }
+
+        DWORD exit_code = 1;
+        GetExitCodeProcess(process.hProcess, &exit_code);
+
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+
+        return exit_code == 0;
     }
 
     std::string WideToUtf8(const std::wstring& value) {
@@ -549,7 +592,6 @@ namespace {
         while (true) {
             if (!witcher::IsAuthenticated()) {
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -565,7 +607,6 @@ namespace {
                 &refreshExpiresAtUnix
             )) {
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -580,7 +621,6 @@ namespace {
                 witcher::ClearAuthTokens();
 
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -601,7 +641,6 @@ namespace {
             DWORD waitMilliseconds = static_cast<DWORD>(secondsUntilRefresh * 1000);
 
             DWORD waitResult = WaitForSingleObject(g_stop_event, waitMilliseconds);
-
             if (waitResult == WAIT_OBJECT_0) {
                 break;
             }
@@ -624,7 +663,6 @@ namespace {
 
             if (!refreshResult.success) {
                 DWORD retryWaitResult = WaitForSingleObject(g_stop_event, 30000);
-
                 if (retryWaitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -661,7 +699,6 @@ namespace {
         while (true) {
             if (!witcher::IsAuthenticated() || !witcher::HasLicenseTicket()) {
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -685,7 +722,6 @@ namespace {
                 witcher::ClearLicenseTicket();
 
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -710,7 +746,6 @@ namespace {
             DWORD waitMilliseconds = static_cast<DWORD>(secondsUntilRefresh * 1000);
 
             DWORD waitResult = WaitForSingleObject(g_stop_event, waitMilliseconds);
-
             if (waitResult == WAIT_OBJECT_0) {
                 break;
             }
@@ -737,7 +772,6 @@ namespace {
 
             if (!licenseResult.success) {
                 DWORD retryWaitResult = WaitForSingleObject(g_stop_event, 30000);
-
                 if (retryWaitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -785,7 +819,6 @@ namespace {
         }
 
         status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, TRUE);
-
         if (status != RPC_S_OK) {
             SetEvent(g_stop_event);
         }
@@ -832,7 +865,6 @@ namespace {
         witcher::InitLicenseState();
 
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-
         if (!g_stop_event) {
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
             witcher::FreeLicenseState();
@@ -842,7 +874,6 @@ namespace {
         }
 
         HANDLE rpc_thread = CreateThread(nullptr, 0, RpcServerThread, nullptr, 0, nullptr);
-
         if (!rpc_thread) {
             CloseHandle(g_stop_event);
             g_stop_event = nullptr;
@@ -956,7 +987,6 @@ namespace {
         GetModuleFileNameW(nullptr, module_path, MAX_PATH);
 
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
-
         if (!scm) {
             return false;
         }
@@ -994,13 +1024,11 @@ namespace {
 
     bool UninstallService() {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-
         if (!scm) {
             return false;
         }
 
         SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
-
         if (!service) {
             CloseServiceHandle(scm);
             return false;
