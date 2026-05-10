@@ -40,8 +40,6 @@ namespace {
     constexpr UINT kLicensePollIntervalMs = 30000;
 
     constexpr wchar_t kProductId[] = L"7a11219b-2bdd-4475-a9fb-c535ce20650d";
-
-    // MAC из твоей базы для лицензии 456AA70CEA0F4D75BBA1EBCBB768641D.
     constexpr wchar_t kMacAddress[] = L"AA-BB-CC-DD-EE-FF";
 
     enum class UiState {
@@ -754,8 +752,6 @@ namespace {
             return;
         }
 
-        // Сначала проверяем текущий статус лицензии.
-        // Это нужно для случая, когда лицензия уже активирована на этом устройстве.
         if (RpcCheckLicenseSafe(license_code)) {
             RefreshApplicationState();
             return;
@@ -763,7 +759,6 @@ namespace {
 
         std::wstring check_error = g_last_error_text;
 
-        // Если check не прошёл, пробуем активацию.
         if (!RpcActivateLicenseSafe(license_code)) {
             std::wstring activate_error = g_last_error_text;
             g_last_error_text =
@@ -794,6 +789,8 @@ namespace {
 
     void RequestServiceStop() {
         if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            BuildCurrentView(g_main_window);
             return;
         }
 
@@ -846,7 +843,8 @@ namespace {
 
     void StopServiceAndExit() {
         RequestServiceStop();
-        ExitApplication();
+
+    
     }
 
     void ShowTrayMenu(HWND hwnd) {

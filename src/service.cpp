@@ -2,11 +2,14 @@
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <rpc.h>
+#include <aclapi.h>
+#include <sddl.h>
 
 #include <filesystem>
 #include <string>
 #include <vector>
 #include <ctime>
+#include <cwchar>
 
 #include "common.h"
 #include "WitcherControl_h.h"
@@ -49,6 +52,160 @@ namespace {
         g_status.dwWaitHint = wait_hint;
 
         SetServiceStatus(g_status_handle, &g_status);
+    }
+
+    bool GetActiveUserSessionId(DWORD* session_id) {
+        if (!session_id) {
+            return false;
+        }
+
+        *session_id = 0;
+
+        WTS_SESSION_INFOW* sessions = nullptr;
+        DWORD count = 0;
+
+        if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
+            for (DWORD i = 0; i < count; ++i) {
+                if (sessions[i].SessionId != 0 && sessions[i].State == WTSActive) {
+                    *session_id = sessions[i].SessionId;
+                    WTSFreeMemory(sessions);
+                    return true;
+                }
+            }
+
+            WTSFreeMemory(sessions);
+        }
+
+        DWORD console_session_id = WTSGetActiveConsoleSessionId();
+
+        if (console_session_id != 0xFFFFFFFF && console_session_id != 0) {
+            *session_id = console_session_id;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool ConfirmServiceStopWithActiveUser() {
+        DWORD active_session_id = 0;
+
+        if (!GetActiveUserSessionId(&active_session_id)) {
+            return false;
+        }
+
+        wchar_t title[] = L"WitcherTrayService";
+        wchar_t message[] = L"Stop WitcherTrayService and close all tray applications?";
+
+        DWORD response = IDNO;
+
+        BOOL sent = WTSSendMessageW(
+            WTS_CURRENT_SERVER_HANDLE,
+            active_session_id,
+            title,
+            static_cast<DWORD>((wcslen(title) + 1) * sizeof(wchar_t)),
+            message,
+            static_cast<DWORD>((wcslen(message) + 1) * sizeof(wchar_t)),
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
+            30,
+            &response,
+            TRUE
+        );
+
+        if (!sent) {
+            return false;
+        }
+
+        return response == IDYES;
+    }
+
+    bool ConfigureProcessDacl(HANDLE process_handle) {
+        if (!process_handle) {
+            return false;
+        }
+
+        //
+        // DACL для защиты процесса от завершения обычным пользователем.
+        //
+        // SYSTEM получает полный доступ.
+        // Administrators / Users / Authenticated Users получают только чтение/синхронизацию.
+        // PROCESS_TERMINATE намеренно не выдаётся.
+        //
+        // Полностью защититься от администратора в user-mode нельзя:
+        // администратор может включить SeDebugPrivilege, сменить владельца/DACL
+        // или использовать kernel-level средства. Это best-effort защита без драйвера.
+        //
+        constexpr wchar_t kProcessSecurityDescriptor[] =
+            L"D:P"
+            L"(A;;GA;;;SY)"
+            L"(A;;0x00121000;;;BA)"
+            L"(A;;0x00121000;;;BU)"
+            L"(A;;0x00121000;;;AU)";
+
+        PSECURITY_DESCRIPTOR security_descriptor = nullptr;
+
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            kProcessSecurityDescriptor,
+            SDDL_REVISION_1,
+            &security_descriptor,
+            nullptr
+        )) {
+            return false;
+        }
+
+        PACL dacl = nullptr;
+        BOOL dacl_present = FALSE;
+        BOOL dacl_defaulted = FALSE;
+
+        if (!GetSecurityDescriptorDacl(
+            security_descriptor,
+            &dacl_present,
+            &dacl,
+            &dacl_defaulted
+        )) {
+            LocalFree(security_descriptor);
+            return false;
+        }
+
+        if (!dacl_present || !dacl) {
+            LocalFree(security_descriptor);
+            return false;
+        }
+
+        DWORD result = SetSecurityInfo(
+            process_handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            nullptr,
+            nullptr,
+            dacl,
+            nullptr
+        );
+
+        LocalFree(security_descriptor);
+
+        return result == ERROR_SUCCESS;
+    }
+
+    bool ConfigureCurrentProcessDacl() {
+        HANDLE process_handle = OpenProcess(
+            WRITE_DAC | READ_CONTROL,
+            FALSE,
+            GetCurrentProcessId()
+        );
+
+        if (!process_handle) {
+            return false;
+        }
+
+        bool result = ConfigureProcessDacl(process_handle);
+
+        CloseHandle(process_handle);
+
+        return result;
+    }
+
+    bool ConfigureChildProcessDacl(HANDLE child_process_handle) {
+        return ConfigureProcessDacl(child_process_handle);
     }
 
     std::filesystem::path GetModuleDirectory() {
@@ -255,6 +412,7 @@ namespace {
             }
 
             DWORD child_session = 0;
+
             if (ProcessIdToSessionId(it->dwProcessId, &child_session) && child_session == session_id) {
                 LeaveCriticalSection(&g_process_lock);
                 return true;
@@ -273,6 +431,7 @@ namespace {
         }
 
         HANDLE user_token = nullptr;
+
         if (!WTSQueryUserToken(session_id, &user_token)) {
             return false;
         }
@@ -287,7 +446,8 @@ namespace {
             &token_attributes,
             SecurityIdentification,
             TokenPrimary,
-            &primary_token)) {
+            &primary_token
+        )) {
             CloseHandle(user_token);
             return false;
         }
@@ -333,6 +493,8 @@ namespace {
         if (!created) {
             return false;
         }
+
+        ConfigureChildProcessDacl(process.hProcess);
 
         EnterCriticalSection(&g_process_lock);
         g_children.push_back(process);
@@ -387,6 +549,7 @@ namespace {
         while (true) {
             if (!witcher::IsAuthenticated()) {
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
+
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -402,6 +565,7 @@ namespace {
                 &refreshExpiresAtUnix
             )) {
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
+
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -416,6 +580,7 @@ namespace {
                 witcher::ClearAuthTokens();
 
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
+
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -436,6 +601,7 @@ namespace {
             DWORD waitMilliseconds = static_cast<DWORD>(secondsUntilRefresh * 1000);
 
             DWORD waitResult = WaitForSingleObject(g_stop_event, waitMilliseconds);
+
             if (waitResult == WAIT_OBJECT_0) {
                 break;
             }
@@ -458,6 +624,7 @@ namespace {
 
             if (!refreshResult.success) {
                 DWORD retryWaitResult = WaitForSingleObject(g_stop_event, 30000);
+
                 if (retryWaitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -494,6 +661,7 @@ namespace {
         while (true) {
             if (!witcher::IsAuthenticated() || !witcher::HasLicenseTicket()) {
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
+
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -517,6 +685,7 @@ namespace {
                 witcher::ClearLicenseTicket();
 
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
+
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -541,6 +710,7 @@ namespace {
             DWORD waitMilliseconds = static_cast<DWORD>(secondsUntilRefresh * 1000);
 
             DWORD waitResult = WaitForSingleObject(g_stop_event, waitMilliseconds);
+
             if (waitResult == WAIT_OBJECT_0) {
                 break;
             }
@@ -567,6 +737,7 @@ namespace {
 
             if (!licenseResult.success) {
                 DWORD retryWaitResult = WaitForSingleObject(g_stop_event, 30000);
+
                 if (retryWaitResult == WAIT_OBJECT_0) {
                     break;
                 }
@@ -614,6 +785,7 @@ namespace {
         }
 
         status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, TRUE);
+
         if (status != RPC_S_OK) {
             SetEvent(g_stop_event);
         }
@@ -653,11 +825,14 @@ namespace {
 
         SetServiceStatusValue(SERVICE_START_PENDING, NO_ERROR, 3000);
 
+        ConfigureCurrentProcessDacl();
+
         InitializeCriticalSection(&g_process_lock);
         witcher::InitAuthState();
         witcher::InitLicenseState();
 
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
         if (!g_stop_event) {
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
             witcher::FreeLicenseState();
@@ -667,6 +842,7 @@ namespace {
         }
 
         HANDLE rpc_thread = CreateThread(nullptr, 0, RpcServerThread, nullptr, 0, nullptr);
+
         if (!rpc_thread) {
             CloseHandle(g_stop_event);
             g_stop_event = nullptr;
@@ -780,6 +956,7 @@ namespace {
         GetModuleFileNameW(nullptr, module_path, MAX_PATH);
 
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+
         if (!scm) {
             return false;
         }
@@ -817,11 +994,13 @@ namespace {
 
     bool UninstallService() {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+
         if (!scm) {
             return false;
         }
 
         SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
+
         if (!service) {
             CloseServiceHandle(scm);
             return false;
@@ -838,9 +1017,15 @@ namespace {
 }
 
 extern "C" void RpcStopService(void) {
-    if (g_stop_event) {
-        SetEvent(g_stop_event);
+    if (!g_stop_event) {
+        return;
     }
+
+    if (!ConfirmServiceStopWithActiveUser()) {
+        return;
+    }
+
+    SetEvent(g_stop_event);
 }
 
 extern "C" long RpcLogin(const wchar_t* username, const wchar_t* password) {
