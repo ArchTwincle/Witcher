@@ -40,6 +40,10 @@ add_executable(TrayWin32App WIN32
 
 add_executable(WitcherTrayService
     src/service.cpp
+    src/auth_state.cpp
+    src/http_client.cpp
+    src/jwt_utils.cpp
+    src/license_state.cpp
     ${RPC_SERVER}
 )
 
@@ -79,6 +83,8 @@ target_link_libraries(WitcherTrayService PRIVATE
     rpcrt4
     wtsapi32
     userenv
+    winhttp
+    crypt32
 )
 
 if(MSVC)
