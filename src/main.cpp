@@ -37,17 +37,20 @@ namespace {
         std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
             return static_cast<wchar_t>(towlower(ch));
             });
+
         return text;
     }
 
     bool HasArgument(const wchar_t* expected) {
         int argc = 0;
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
         if (!argv) {
             return false;
         }
 
         bool found = false;
+
         for (int i = 1; i < argc; ++i) {
             if (_wcsicmp(argv[i], expected) == 0) {
                 found = true;
@@ -59,17 +62,85 @@ namespace {
         return found;
     }
 
+    int RunSecureStopConfirmation() {
+        HDESK original_desktop = OpenInputDesktop(
+            0,
+            FALSE,
+            DESKTOP_SWITCHDESKTOP | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS
+        );
+
+        HDESK confirm_desktop = CreateDesktopW(
+            L"WitcherStopConfirmationDesktop",
+            nullptr,
+            nullptr,
+            0,
+            GENERIC_ALL,
+            nullptr
+        );
+
+        if (!confirm_desktop) {
+            int fallback_result = MessageBoxW(
+                nullptr,
+                L"Stop WitcherTrayService and close all tray applications?",
+                L"WitcherTrayService",
+                MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
+            );
+
+            if (original_desktop) {
+                CloseDesktop(original_desktop);
+            }
+
+            return fallback_result == IDYES ? 0 : 1;
+        }
+
+        bool switched_to_confirm = SwitchDesktop(confirm_desktop) != FALSE;
+        bool thread_desktop_set = SetThreadDesktop(confirm_desktop) != FALSE;
+
+        int result = IDNO;
+
+        if (switched_to_confirm && thread_desktop_set) {
+            result = MessageBoxW(
+                nullptr,
+                L"Stop WitcherTrayService and close all tray applications?",
+                L"WitcherTrayService",
+                MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
+            );
+        }
+
+        if (original_desktop) {
+            SwitchDesktop(original_desktop);
+        }
+
+        CloseDesktop(confirm_desktop);
+
+        if (original_desktop) {
+            CloseDesktop(original_desktop);
+        }
+
+        if (!switched_to_confirm || !thread_desktop_set) {
+            return 1;
+        }
+
+        return result == IDYES ? 0 : 1;
+    }
+
     bool HasHiddenStartupArgument() {
         return HasArgument(L"--hidden") || HasArgument(L"--no-window") || HasArgument(L"/hidden");
     }
 
     bool QueryServiceState(DWORD* state) {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+
         if (!scm) {
             return false;
         }
 
-        SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+        SC_HANDLE service = OpenServiceW(
+            scm,
+            witcher::kServiceName,
+            SERVICE_QUERY_STATUS | SERVICE_START
+        );
+
         if (!service) {
             CloseServiceHandle(scm);
             return false;
@@ -83,7 +154,8 @@ namespace {
             SC_STATUS_PROCESS_INFO,
             reinterpret_cast<LPBYTE>(&status),
             sizeof(status),
-            &bytes_needed);
+            &bytes_needed
+        );
 
         if (ok && state) {
             *state = status.dwCurrentState;
@@ -91,16 +163,23 @@ namespace {
 
         CloseServiceHandle(service);
         CloseServiceHandle(scm);
+
         return ok != FALSE;
     }
 
     bool StartServiceAndWaitRunning() {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+
         if (!scm) {
             return false;
         }
 
-        SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+        SC_HANDLE service = OpenServiceW(
+            scm,
+            witcher::kServiceName,
+            SERVICE_QUERY_STATUS | SERVICE_START
+        );
+
         if (!service) {
             CloseServiceHandle(scm);
             return false;
@@ -109,7 +188,13 @@ namespace {
         SERVICE_STATUS_PROCESS status{};
         DWORD bytes_needed = 0;
 
-        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
+        if (!QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            reinterpret_cast<LPBYTE>(&status),
+            sizeof(status),
+            &bytes_needed
+        )) {
             CloseServiceHandle(service);
             CloseServiceHandle(scm);
             return false;
@@ -120,8 +205,15 @@ namespace {
         }
 
         bool running = false;
+
         for (int i = 0; i < 50; ++i) {
-            if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytes_needed)) {
+            if (!QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                reinterpret_cast<LPBYTE>(&status),
+                sizeof(status),
+                &bytes_needed
+            )) {
                 break;
             }
 
@@ -135,6 +227,7 @@ namespace {
 
         CloseServiceHandle(service);
         CloseServiceHandle(scm);
+
         return running;
     }
 
@@ -147,6 +240,7 @@ namespace {
         const DWORD current_pid = GetCurrentProcessId();
 
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
         if (snapshot == INVALID_HANDLE_VALUE) {
             return 0;
         }
@@ -166,11 +260,13 @@ namespace {
         }
 
         CloseHandle(snapshot);
+
         return parent_pid;
     }
 
     std::wstring GetProcessImageBaseName(DWORD pid) {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
         if (snapshot == INVALID_HANDLE_VALUE) {
             return L"";
         }
@@ -190,11 +286,13 @@ namespace {
         }
 
         CloseHandle(snapshot);
+
         return name;
     }
 
     bool IsParentServiceProcess() {
         const DWORD parent_pid = GetParentProcessId();
+
         if (parent_pid == 0) {
             return false;
         }
@@ -212,7 +310,8 @@ namespace {
             nullptr,
             reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(witcher::kRpcEndpoint)),
             nullptr,
-            &string_binding);
+            &string_binding
+        );
 
         if (status != RPC_S_OK) {
             return;
@@ -225,10 +324,12 @@ namespace {
             return;
         }
 
-        RpcTryExcept{
+        RpcTryExcept
+        {
             RpcStopService();
         }
-            RpcExcept(1) {
+            RpcExcept(1)
+        {
         }
         RpcEndExcept
 
@@ -260,10 +361,13 @@ namespace {
         g_tray_icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         g_tray_icon.uCallbackMessage = kTrayCallbackMessage;
         g_tray_icon.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_TRAY_ICON));
+
         wcscpy_s(g_tray_icon.szTip, L"Tourism Service Tray App");
 
         Shell_NotifyIconW(NIM_ADD, &g_tray_icon);
+
         g_tray_icon.uVersion = NOTIFYICON_VERSION_4;
+
         Shell_NotifyIconW(NIM_SETVERSION, &g_tray_icon);
     }
 
@@ -279,8 +383,9 @@ namespace {
         /*
             Do not close the GUI immediately.
 
-            If the user confirms the service stop, the service will terminate
-            all launched TrayWin32App.exe processes in TerminateChildren().
+            If the user confirms the service stop on the private desktop,
+            the service will terminate all launched TrayWin32App.exe processes
+            in TerminateChildren().
 
             If the user clicks No or the confirmation cannot be shown,
             the tray app remains running.
@@ -292,6 +397,7 @@ namespace {
         GetCursorPos(&cursor_position);
 
         HMENU menu = CreatePopupMenu();
+
         if (!menu) {
             return;
         }
@@ -309,7 +415,8 @@ namespace {
             cursor_position.y,
             0,
             hwnd,
-            nullptr);
+            nullptr
+        );
 
         DestroyMenu(menu);
 
@@ -317,9 +424,11 @@ namespace {
         case kMenuOpen:
             ShowMainWindow();
             break;
+
         case kMenuExit:
             StopServiceAndExit();
             break;
+
         default:
             break;
         }
@@ -387,7 +496,8 @@ namespace {
             L"Tourism Service Tray App",
             -1,
             &text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE
+        );
 
         EndPaint(hwnd, &ps);
     }
@@ -429,6 +539,7 @@ namespace {
             default:
                 break;
             }
+
             break;
 
         case WM_PAINT:
@@ -440,6 +551,7 @@ namespace {
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
             }
+
             break;
 
         case WM_DESTROY:
@@ -481,7 +593,8 @@ namespace {
             nullptr,
             CreateMainMenu(),
             g_instance,
-            nullptr);
+            nullptr
+        );
     }
 
 } // namespace
@@ -497,6 +610,10 @@ extern "C" void __RPC_USER midl_user_free(void* pointer) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     g_instance = instance;
 
+    if (HasArgument(L"--secure-stop-confirm")) {
+        return RunSecureStopConfirmation();
+    }
+
     if (IsServiceStopped()) {
         StartServiceAndWaitRunning();
         return 0;
@@ -507,10 +624,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     }
 
     g_single_instance_mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+
     if (!g_single_instance_mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (g_single_instance_mutex) {
             CloseHandle(g_single_instance_mutex);
         }
+
         return 0;
     }
 
@@ -522,6 +641,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     }
 
     g_main_window = CreateMainWindow();
+
     if (!g_main_window) {
         CloseHandle(g_single_instance_mutex);
         return 1;
@@ -533,6 +653,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     }
 
     MSG message{};
+
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         TranslateMessage(&message);
         DispatchMessageW(&message);

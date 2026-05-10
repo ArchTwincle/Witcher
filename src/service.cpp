@@ -70,38 +70,6 @@ namespace {
         return false;
     }
 
-    bool ConfirmServiceStopWithActiveUser() {
-        DWORD active_session_id = 0;
-
-        if (!GetActiveUserSessionId(&active_session_id)) {
-            return false;
-        }
-
-        wchar_t title[] = L"WitcherTrayService";
-        wchar_t message[] = L"Stop WitcherTrayService and close all tray applications?";
-
-        DWORD response = IDNO;
-
-        BOOL sent = WTSSendMessageW(
-            WTS_CURRENT_SERVER_HANDLE,
-            active_session_id,
-            title,
-            static_cast<DWORD>((wcslen(title) + 1) * sizeof(wchar_t)),
-            message,
-            static_cast<DWORD>((wcslen(message) + 1) * sizeof(wchar_t)),
-            MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
-            30,
-            &response,
-            TRUE
-        );
-
-        if (!sent) {
-            return false;
-        }
-
-        return response == IDYES;
-    }
-
     bool ConfigureProcessDacl(HANDLE process_handle) {
         if (!process_handle) {
             return false;
@@ -199,6 +167,92 @@ namespace {
         return std::filesystem::path(path).parent_path();
     }
 
+    bool RunSecureStopConfirmationInActiveSession() {
+        DWORD active_session_id = 0;
+
+        if (!GetActiveUserSessionId(&active_session_id)) {
+            return false;
+        }
+
+        HANDLE user_token = nullptr;
+
+        if (!WTSQueryUserToken(active_session_id, &user_token)) {
+            return false;
+        }
+
+        HANDLE primary_token = nullptr;
+        SECURITY_ATTRIBUTES token_attributes{};
+        token_attributes.nLength = sizeof(token_attributes);
+
+        if (!DuplicateTokenEx(
+            user_token,
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+            &token_attributes,
+            SecurityIdentification,
+            TokenPrimary,
+            &primary_token
+        )) {
+            CloseHandle(user_token);
+            return false;
+        }
+
+        CloseHandle(user_token);
+
+        void* environment = nullptr;
+        CreateEnvironmentBlock(&environment, primary_token, FALSE);
+
+        const auto module_directory = GetModuleDirectory();
+        const auto app_path = module_directory / witcher::kTrayAppExeName;
+
+        std::wstring command_line =
+            L"\"" + app_path.wstring() + L"\" --secure-stop-confirm";
+
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+
+        PROCESS_INFORMATION process{};
+
+        BOOL created = CreateProcessAsUserW(
+            primary_token,
+            app_path.c_str(),
+            command_line.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_UNICODE_ENVIRONMENT,
+            environment,
+            module_directory.c_str(),
+            &startup,
+            &process
+        );
+
+        if (environment) {
+            DestroyEnvironmentBlock(environment);
+        }
+
+        CloseHandle(primary_token);
+
+        if (!created) {
+            return false;
+        }
+
+        DWORD wait_result = WaitForSingleObject(process.hProcess, 30000);
+
+        if (wait_result == WAIT_TIMEOUT) {
+            TerminateProcess(process.hProcess, 1);
+            WaitForSingleObject(process.hProcess, 3000);
+        }
+
+        DWORD exit_code = 1;
+        GetExitCodeProcess(process.hProcess, &exit_code);
+
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+
+        return exit_code == 0;
+    }
+
     bool IsSessionAlreadyStarted(DWORD session_id) {
         EnterCriticalSection(&g_process_lock);
 
@@ -213,6 +267,7 @@ namespace {
             }
 
             DWORD child_session = 0;
+
             if (ProcessIdToSessionId(it->dwProcessId, &child_session) && child_session == session_id) {
                 LeaveCriticalSection(&g_process_lock);
                 return true;
@@ -231,6 +286,7 @@ namespace {
         }
 
         HANDLE user_token = nullptr;
+
         if (!WTSQueryUserToken(session_id, &user_token)) {
             return false;
         }
@@ -245,7 +301,8 @@ namespace {
             &token_attributes,
             SecurityIdentification,
             TokenPrimary,
-            &primary_token)) {
+            &primary_token
+        )) {
             CloseHandle(user_token);
             return false;
         }
@@ -279,7 +336,8 @@ namespace {
             environment,
             module_directory.c_str(),
             &startup,
-            &process);
+            &process
+        );
 
         if (environment) {
             DestroyEnvironmentBlock(environment);
@@ -347,7 +405,8 @@ namespace {
             reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
             RPC_C_PROTSEQ_MAX_REQS_DEFAULT,
             reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(witcher::kRpcEndpoint)),
-            nullptr);
+            nullptr
+        );
 
         if (status != RPC_S_OK && status != RPC_S_DUPLICATE_ENDPOINT) {
             SetEvent(g_stop_event);
@@ -361,7 +420,8 @@ namespace {
             RPC_IF_ALLOW_LOCAL_ONLY,
             RPC_C_LISTEN_MAX_CALLS_DEFAULT,
             static_cast<unsigned>(-1),
-            nullptr);
+            nullptr
+        );
 
         if (status != RPC_S_OK) {
             SetEvent(g_stop_event);
@@ -369,6 +429,7 @@ namespace {
         }
 
         status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, TRUE);
+
         if (status != RPC_S_OK) {
             SetEvent(g_stop_event);
         }
@@ -396,7 +457,12 @@ namespace {
     }
 
     void WINAPI ServiceMain(DWORD, LPWSTR*) {
-        g_status_handle = RegisterServiceCtrlHandlerExW(witcher::kServiceName, ServiceControlHandlerEx, nullptr);
+        g_status_handle = RegisterServiceCtrlHandlerExW(
+            witcher::kServiceName,
+            ServiceControlHandlerEx,
+            nullptr
+        );
+
         if (!g_status_handle) {
             return;
         }
@@ -408,6 +474,7 @@ namespace {
         InitializeCriticalSection(&g_process_lock);
 
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
         if (!g_stop_event) {
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
             DeleteCriticalSection(&g_process_lock);
@@ -415,8 +482,10 @@ namespace {
         }
 
         HANDLE rpc_thread = CreateThread(nullptr, 0, RpcServerThread, nullptr, 0, nullptr);
+
         if (!rpc_thread) {
             CloseHandle(g_stop_event);
+            g_stop_event = nullptr;
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
             DeleteCriticalSection(&g_process_lock);
             return;
@@ -439,6 +508,8 @@ namespace {
         TerminateChildren();
 
         CloseHandle(g_stop_event);
+        g_stop_event = nullptr;
+
         DeleteCriticalSection(&g_process_lock);
 
         SetServiceStatusValue(SERVICE_STOPPED);
@@ -449,6 +520,7 @@ namespace {
         GetModuleFileNameW(nullptr, module_path, MAX_PATH);
 
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+
         if (!scm) {
             return false;
         }
@@ -466,7 +538,8 @@ namespace {
             nullptr,
             nullptr,
             nullptr,
-            nullptr);
+            nullptr
+        );
 
         if (!service && GetLastError() == ERROR_SERVICE_EXISTS) {
             service = OpenServiceW(scm, witcher::kServiceName, SERVICE_CHANGE_CONFIG | SERVICE_START);
@@ -485,11 +558,13 @@ namespace {
 
     bool UninstallService() {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+
         if (!scm) {
             return false;
         }
 
         SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
+
         if (!service) {
             CloseServiceHandle(scm);
             return false;
@@ -510,7 +585,7 @@ extern "C" void RpcStopService(void) {
         return;
     }
 
-    if (!ConfirmServiceStopWithActiveUser()) {
+    if (!RunSecureStopConfirmationInActiveSession()) {
         return;
     }
 
