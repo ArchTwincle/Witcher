@@ -191,7 +191,10 @@ namespace {
     }
 
     void StoreLicenseTicket(
-        const std::string& licenseTicket
+        const std::string& licenseTicket,
+        const std::string& licenseCode,
+        const std::string& macAddress,
+        const std::string& productId
     ) {
         long long ticketLifetimeSeconds = ExtractJsonNumber(
             licenseTicket,
@@ -206,7 +209,10 @@ namespace {
         witcher::SetLicenseTicket(
             licenseTicket,
             ticketLifetimeSeconds,
-            expirationDate
+            expirationDate,
+            licenseCode,
+            macAddress,
+            productId
         );
     }
 
@@ -485,10 +491,6 @@ namespace {
     }
 
     DWORD WINAPI LicenseRefreshThread(void*) {
-        const std::wstring licenseCode = L"8726F3E859BF4FB59AFCF61924C14FF3";
-        const std::wstring macAddress = L"AA-BB-CC-DD-EE-AF";
-        const std::wstring productId = L"7a11219b-2bdd-4475-a9fb-c535ce20650d";
-
         while (true) {
             if (!witcher::IsAuthenticated() || !witcher::HasLicenseTicket()) {
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
@@ -501,11 +503,19 @@ namespace {
 
             long long ticketSavedAtUnix = 0;
             long long ticketLifetimeSeconds = 0;
+            std::string licenseCode;
+            std::string macAddress;
+            std::string productId;
 
-            if (!witcher::GetLicenseRefreshInfo(
+            if (!witcher::GetLicenseRefreshRequestInfo(
                 &ticketSavedAtUnix,
-                &ticketLifetimeSeconds
+                &ticketLifetimeSeconds,
+                &licenseCode,
+                &macAddress,
+                &productId
             )) {
+                witcher::ClearLicenseTicket();
+
                 DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
                 if (waitResult == WAIT_OBJECT_0) {
                     break;
@@ -550,9 +560,9 @@ namespace {
             witcher::LicenseCheckResult licenseResult =
                 witcher::CheckLicenseRequest(
                     accessToken,
-                    WideToUtf8(licenseCode),
-                    WideToUtf8(macAddress),
-                    WideToUtf8(productId)
+                    licenseCode,
+                    macAddress,
+                    productId
                 );
 
             if (!licenseResult.success) {
@@ -564,7 +574,12 @@ namespace {
                 continue;
             }
 
-            StoreLicenseTicket(licenseResult.licenseTicket);
+            StoreLicenseTicket(
+                licenseResult.licenseTicket,
+                licenseCode,
+                macAddress,
+                productId
+            );
         }
 
         return 0;
@@ -920,12 +935,16 @@ extern "C" long RpcCheckLicense(
         return ERROR_NOT_LOGGED_ON;
     }
 
+    const std::string licenseCodeUtf8 = WideToUtf8(licenseCode);
+    const std::string macAddressUtf8 = WideToUtf8(macAddress);
+    const std::string productIdUtf8 = WideToUtf8(productId);
+
     witcher::LicenseCheckResult licenseResult =
         witcher::CheckLicenseRequest(
             accessToken,
-            WideToUtf8(licenseCode),
-            WideToUtf8(macAddress),
-            WideToUtf8(productId)
+            licenseCodeUtf8,
+            macAddressUtf8,
+            productIdUtf8
         );
 
     if (!licenseResult.success) {
@@ -933,7 +952,12 @@ extern "C" long RpcCheckLicense(
         return licenseResult.errorCode;
     }
 
-    StoreLicenseTicket(licenseResult.licenseTicket);
+    StoreLicenseTicket(
+        licenseResult.licenseTicket,
+        licenseCodeUtf8,
+        macAddressUtf8,
+        productIdUtf8
+    );
 
     return ERROR_SUCCESS;
 }
@@ -977,7 +1001,13 @@ extern "C" long RpcActivateLicense(
     }
 
     if (!activateResult.licenseTicket.empty()) {
-        StoreLicenseTicket(activateResult.licenseTicket);
+        StoreLicenseTicket(
+            activateResult.licenseTicket,
+            licenseCodeUtf8,
+            macAddressUtf8,
+            productIdUtf8
+        );
+
         return ERROR_SUCCESS;
     }
 
@@ -994,7 +1024,12 @@ extern "C" long RpcActivateLicense(
         return checkResult.errorCode;
     }
 
-    StoreLicenseTicket(checkResult.licenseTicket);
+    StoreLicenseTicket(
+        checkResult.licenseTicket,
+        licenseCodeUtf8,
+        macAddressUtf8,
+        productIdUtf8
+    );
 
     return ERROR_SUCCESS;
 }
@@ -1029,6 +1064,21 @@ extern "C" long RpcGetLicenseInfo(
         return ERROR_INVALID_PARAMETER;
     }
 
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcGetAntivirusStatus(long* isEnabled) {
+    if (!isEnabled) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    *isEnabled = 0;
+
+    if (!witcher::HasLicenseTicket()) {
+        return witcher::kErrorNoLicense;
+    }
+
+    *isEnabled = 1;
     return ERROR_SUCCESS;
 }
 

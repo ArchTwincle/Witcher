@@ -40,4 +40,8 @@ interface WitcherControl
         [out, size_is(expirationDateCapacity)] wchar_t* expirationDateBuffer,
         [in] unsigned long expirationDateCapacity
     );
-}   
+
+    long RpcGetAntivirusStatus(
+        [out] long* isEnabled
+    );
+}

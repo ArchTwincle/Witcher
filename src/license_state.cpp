@@ -22,7 +22,10 @@ namespace witcher {
     void SetLicenseTicket(
         const std::string& licenseTicket,
         long long ticketLifetimeSeconds,
-        const std::string& expirationDate
+        const std::string& expirationDate,
+        const std::string& licenseCode,
+        const std::string& macAddress,
+        const std::string& productId
     ) {
         EnterCriticalSection(&g_license_lock);
 
@@ -31,6 +34,18 @@ namespace witcher {
         g_license_state.ticketLifetimeSeconds = ticketLifetimeSeconds;
         g_license_state.ticketSavedAtUnix = static_cast<long long>(std::time(nullptr));
         g_license_state.expirationDate = expirationDate;
+
+        if (!licenseCode.empty()) {
+            g_license_state.licenseCode = licenseCode;
+        }
+
+        if (!macAddress.empty()) {
+            g_license_state.macAddress = macAddress;
+        }
+
+        if (!productId.empty()) {
+            g_license_state.productId = productId;
+        }
 
         LeaveCriticalSection(&g_license_lock);
     }
@@ -76,6 +91,45 @@ namespace witcher {
         }
 
         bool result = g_license_state.hasLicenseTicket;
+
+        LeaveCriticalSection(&g_license_lock);
+        return result;
+    }
+
+    bool GetLicenseRefreshRequestInfo(
+        long long* ticketSavedAtUnix,
+        long long* ticketLifetimeSeconds,
+        std::string* licenseCode,
+        std::string* macAddress,
+        std::string* productId
+    ) {
+        EnterCriticalSection(&g_license_lock);
+
+        bool result =
+            g_license_state.hasLicenseTicket &&
+            !g_license_state.licenseCode.empty() &&
+            !g_license_state.macAddress.empty() &&
+            !g_license_state.productId.empty();
+
+        if (ticketSavedAtUnix) {
+            *ticketSavedAtUnix = g_license_state.ticketSavedAtUnix;
+        }
+
+        if (ticketLifetimeSeconds) {
+            *ticketLifetimeSeconds = g_license_state.ticketLifetimeSeconds;
+        }
+
+        if (licenseCode) {
+            *licenseCode = g_license_state.licenseCode;
+        }
+
+        if (macAddress) {
+            *macAddress = g_license_state.macAddress;
+        }
+
+        if (productId) {
+            *productId = g_license_state.productId;
+        }
 
         LeaveCriticalSection(&g_license_lock);
         return result;

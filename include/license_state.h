@@ -13,6 +13,10 @@ namespace witcher {
         long long ticketSavedAtUnix = 0;
 
         std::string expirationDate;
+
+        std::string licenseCode;
+        std::string macAddress;
+        std::string productId;
     };
 
     void InitLicenseState();
@@ -21,7 +25,10 @@ namespace witcher {
     void SetLicenseTicket(
         const std::string& licenseTicket,
         long long ticketLifetimeSeconds = 0,
-        const std::string& expirationDate = ""
+        const std::string& expirationDate = "",
+        const std::string& licenseCode = "",
+        const std::string& macAddress = "",
+        const std::string& productId = ""
     );
 
     void ClearLicenseTicket();
@@ -33,6 +40,14 @@ namespace witcher {
     bool GetLicenseRefreshInfo(
         long long* ticketSavedAtUnix,
         long long* ticketLifetimeSeconds
+    );
+
+    bool GetLicenseRefreshRequestInfo(
+        long long* ticketSavedAtUnix,
+        long long* ticketLifetimeSeconds,
+        std::string* licenseCode,
+        std::string* macAddress,
+        std::string* productId
     );
 
     bool GetLicensePublicInfo(
