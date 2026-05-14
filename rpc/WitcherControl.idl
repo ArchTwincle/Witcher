@@ -71,4 +71,43 @@ interface WitcherControl
         [out] unsigned long long* scannedFiles,
         [out] unsigned long long* maliciousFiles
     );
+
+    long RpcScanFixedDrives(
+        [out] long* isMalicious,
+        [out, size_is(threatNameCapacity)] wchar_t* threatNameBuffer,
+        [in] unsigned long threatNameCapacity,
+        [out] unsigned long long* scannedFiles,
+        [out] unsigned long long* maliciousFiles
+    );
+
+    long RpcSetScheduledScan(
+        [in] long isEnabled,
+        [in] unsigned long intervalSeconds
+    );
+
+    long RpcGetScheduledScanStatus(
+        [out] long* isEnabled,
+        [out] unsigned long* intervalSeconds,
+        [out] unsigned long long* lastScannedFiles,
+        [out] unsigned long long* lastMaliciousFiles,
+        [out] long* lastIsMalicious,
+        [out, size_is(threatNameCapacity)] wchar_t* lastThreatNameBuffer,
+        [in] unsigned long threatNameCapacity
+    );
+
+    long RpcSetMonitoredDirectory(
+        [in] long isEnabled,
+        [in, string] const wchar_t* directoryPath
+    );
+
+    long RpcGetMonitoredDirectoryStatus(
+        [out] long* isEnabled,
+        [out, size_is(directoryPathCapacity)] wchar_t* directoryPathBuffer,
+        [in] unsigned long directoryPathCapacity,
+        [out] unsigned long long* lastScannedFiles,
+        [out] unsigned long long* lastMaliciousFiles,
+        [out] long* lastIsMalicious,
+        [out, size_is(threatNameCapacity)] wchar_t* lastThreatNameBuffer,
+        [in] unsigned long threatNameCapacity
+    );
 }

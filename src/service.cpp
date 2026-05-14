@@ -29,11 +29,26 @@ namespace {
 
     SERVICE_STATUS_HANDLE g_status_handle = nullptr;
     SERVICE_STATUS g_status{};
+
     HANDLE g_stop_event = nullptr;
     HANDLE g_refresh_thread = nullptr;
     HANDLE g_license_thread = nullptr;
+    HANDLE g_schedule_thread = nullptr;
+    HANDLE g_monitor_thread = nullptr;
+    HANDLE g_monitor_wakeup_event = nullptr;
+
     CRITICAL_SECTION g_process_lock;
+    CRITICAL_SECTION g_av_options_lock;
+
     std::vector<PROCESS_INFORMATION> g_children;
+
+    bool g_scheduled_scan_enabled = false;
+    unsigned long g_scheduled_scan_interval_seconds = 10;
+    witcher_av::ScanResult g_scheduled_scan_last_result{};
+
+    bool g_monitoring_enabled = false;
+    std::wstring g_monitored_directory;
+    witcher_av::ScanResult g_monitoring_last_result{};
 
     void SetServiceStatusValue(
         DWORD state,
@@ -469,6 +484,35 @@ namespace {
         return true;
     }
 
+    void CopyScanResultToRpcOutputs(
+        const witcher_av::ScanResult& result,
+        long* isMalicious,
+        wchar_t* threatNameBuffer,
+        unsigned long threatNameCapacity,
+        unsigned long long* scannedFiles,
+        unsigned long long* maliciousFiles
+    ) {
+        if (isMalicious) {
+            *isMalicious = result.malicious ? 1 : 0;
+        }
+
+        if (scannedFiles) {
+            *scannedFiles = result.scannedFiles;
+        }
+
+        if (maliciousFiles) {
+            *maliciousFiles = result.maliciousFiles;
+        }
+
+        if (threatNameBuffer && threatNameCapacity > 0) {
+            CopyStringToRpcBuffer(
+                result.threatName,
+                threatNameBuffer,
+                threatNameCapacity
+            );
+        }
+    }
+
     bool IsSessionAlreadyStarted(DWORD session_id) {
         EnterCriticalSection(&g_process_lock);
 
@@ -817,6 +861,156 @@ namespace {
         return 0;
     }
 
+    DWORD WINAPI ScheduledScanThread(void*) {
+        while (true) {
+            bool enabled = false;
+            unsigned long interval_seconds = 10;
+
+            EnterCriticalSection(&g_av_options_lock);
+            enabled = g_scheduled_scan_enabled;
+            interval_seconds = g_scheduled_scan_interval_seconds;
+            LeaveCriticalSection(&g_av_options_lock);
+
+            if (!enabled) {
+                if (WaitForSingleObject(g_stop_event, 5000) == WAIT_OBJECT_0) {
+                    break;
+                }
+
+                continue;
+            }
+
+            if (interval_seconds == 0) {
+                interval_seconds = 10;
+            }
+
+            DWORD wait_ms = interval_seconds * 1000;
+
+            if (WaitForSingleObject(g_stop_event, wait_ms) == WAIT_OBJECT_0) {
+                break;
+            }
+
+            if (!witcher::HasLicenseTicket()) {
+                continue;
+            }
+
+            if (!witcher_av::IsDatabaseLoaded()) {
+                witcher_av::LoadDefaultDatabase();
+            }
+
+            witcher_av::ScanResult result{};
+
+            if (witcher_av::ScanFixedDrives(&result)) {
+                EnterCriticalSection(&g_av_options_lock);
+                g_scheduled_scan_last_result = result;
+                LeaveCriticalSection(&g_av_options_lock);
+            }
+        }
+
+        return 0;
+    }
+
+    DWORD WINAPI DirectoryMonitorThread(void*) {
+        while (true) {
+            bool enabled = false;
+            std::wstring directory;
+
+            EnterCriticalSection(&g_av_options_lock);
+            enabled = g_monitoring_enabled;
+            directory = g_monitored_directory;
+            LeaveCriticalSection(&g_av_options_lock);
+
+            if (!enabled || directory.empty()) {
+                HANDLE wait_handles[] = {
+                    g_stop_event,
+                    g_monitor_wakeup_event
+                };
+
+                DWORD wait_result = WaitForMultipleObjects(
+                    2,
+                    wait_handles,
+                    FALSE,
+                    5000
+                );
+
+                if (wait_result == WAIT_OBJECT_0) {
+                    break;
+                }
+
+                continue;
+            }
+
+            HANDLE change_notification = FindFirstChangeNotificationW(
+                directory.c_str(),
+                TRUE,
+                FILE_NOTIFY_CHANGE_FILE_NAME |
+                FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_SIZE |
+                FILE_NOTIFY_CHANGE_LAST_WRITE |
+                FILE_NOTIFY_CHANGE_CREATION
+            );
+
+            if (change_notification == INVALID_HANDLE_VALUE) {
+                if (WaitForSingleObject(g_stop_event, 5000) == WAIT_OBJECT_0) {
+                    break;
+                }
+
+                continue;
+            }
+
+            bool recreate_notification = false;
+
+            while (!recreate_notification) {
+                HANDLE wait_handles[] = {
+                    g_stop_event,
+                    g_monitor_wakeup_event,
+                    change_notification
+                };
+
+                DWORD wait_result = WaitForMultipleObjects(
+                    3,
+                    wait_handles,
+                    FALSE,
+                    INFINITE
+                );
+
+                if (wait_result == WAIT_OBJECT_0) {
+                    FindCloseChangeNotification(change_notification);
+                    return 0;
+                }
+
+                if (wait_result == WAIT_OBJECT_0 + 1) {
+                    recreate_notification = true;
+                    break;
+                }
+
+                if (wait_result == WAIT_OBJECT_0 + 2) {
+                    if (witcher::HasLicenseTicket()) {
+                        if (!witcher_av::IsDatabaseLoaded()) {
+                            witcher_av::LoadDefaultDatabase();
+                        }
+
+                        witcher_av::ScanResult result{};
+
+                        if (witcher_av::ScanDirectory(directory, &result)) {
+                            EnterCriticalSection(&g_av_options_lock);
+                            g_monitoring_last_result = result;
+                            LeaveCriticalSection(&g_av_options_lock);
+                        }
+                    }
+
+                    if (!FindNextChangeNotification(change_notification)) {
+                        recreate_notification = true;
+                        break;
+                    }
+                }
+            }
+
+            FindCloseChangeNotification(change_notification);
+        }
+
+        return 0;
+    }
+
     DWORD WINAPI RpcServerThread(void*) {
         RPC_STATUS status = RpcServerUseProtseqEpW(
             reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
@@ -894,17 +1088,33 @@ namespace {
         ConfigureCurrentProcessDacl();
 
         InitializeCriticalSection(&g_process_lock);
+        InitializeCriticalSection(&g_av_options_lock);
+
         witcher::InitAuthState();
         witcher::InitLicenseState();
         witcher_av::InitializeAvEngine();
 
+        g_monitor_wakeup_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-        if (!g_stop_event) {
+        if (!g_stop_event || !g_monitor_wakeup_event) {
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
+
+            if (g_monitor_wakeup_event) {
+                CloseHandle(g_monitor_wakeup_event);
+                g_monitor_wakeup_event = nullptr;
+            }
+
+            if (g_stop_event) {
+                CloseHandle(g_stop_event);
+                g_stop_event = nullptr;
+            }
+
             witcher_av::FreeAvEngine();
             witcher::FreeLicenseState();
             witcher::FreeAuthState();
+
+            DeleteCriticalSection(&g_av_options_lock);
             DeleteCriticalSection(&g_process_lock);
             return;
         }
@@ -912,30 +1122,8 @@ namespace {
         HANDLE rpc_thread = CreateThread(nullptr, 0, RpcServerThread, nullptr, 0, nullptr);
 
         if (!rpc_thread) {
-            CloseHandle(g_stop_event);
-            g_stop_event = nullptr;
-            SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
-            witcher_av::FreeAvEngine();
-            witcher::FreeLicenseState();
-            witcher::FreeAuthState();
-            DeleteCriticalSection(&g_process_lock);
-            return;
-        }
-
-        g_refresh_thread = CreateThread(
-            nullptr,
-            0,
-            TokenRefreshThread,
-            nullptr,
-            0,
-            nullptr
-        );
-
-        if (!g_refresh_thread) {
-            RpcMgmtStopServerListening(nullptr);
-            WaitForSingleObject(rpc_thread, 5000);
-            RpcServerUnregisterIf(WitcherControl_v1_0_s_ifspec, nullptr, FALSE);
-            CloseHandle(rpc_thread);
+            CloseHandle(g_monitor_wakeup_event);
+            g_monitor_wakeup_event = nullptr;
 
             CloseHandle(g_stop_event);
             g_stop_event = nullptr;
@@ -945,44 +1133,16 @@ namespace {
             witcher_av::FreeAvEngine();
             witcher::FreeLicenseState();
             witcher::FreeAuthState();
+
+            DeleteCriticalSection(&g_av_options_lock);
             DeleteCriticalSection(&g_process_lock);
             return;
         }
 
-        g_license_thread = CreateThread(
-            nullptr,
-            0,
-            LicenseRefreshThread,
-            nullptr,
-            0,
-            nullptr
-        );
-
-        if (!g_license_thread) {
-            SetEvent(g_stop_event);
-
-            if (g_refresh_thread) {
-                WaitForSingleObject(g_refresh_thread, 5000);
-                CloseHandle(g_refresh_thread);
-                g_refresh_thread = nullptr;
-            }
-
-            RpcMgmtStopServerListening(nullptr);
-            WaitForSingleObject(rpc_thread, 5000);
-            RpcServerUnregisterIf(WitcherControl_v1_0_s_ifspec, nullptr, FALSE);
-            CloseHandle(rpc_thread);
-
-            CloseHandle(g_stop_event);
-            g_stop_event = nullptr;
-
-            SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
-
-            witcher_av::FreeAvEngine();
-            witcher::FreeLicenseState();
-            witcher::FreeAuthState();
-            DeleteCriticalSection(&g_process_lock);
-            return;
-        }
+        g_refresh_thread = CreateThread(nullptr, 0, TokenRefreshThread, nullptr, 0, nullptr);
+        g_license_thread = CreateThread(nullptr, 0, LicenseRefreshThread, nullptr, 0, nullptr);
+        g_schedule_thread = CreateThread(nullptr, 0, ScheduledScanThread, nullptr, 0, nullptr);
+        g_monitor_thread = CreateThread(nullptr, 0, DirectoryMonitorThread, nullptr, 0, nullptr);
 
         LaunchTrayAppsInExistingSessions();
 
@@ -995,6 +1155,22 @@ namespace {
         RpcMgmtStopServerListening(nullptr);
         WaitForSingleObject(rpc_thread, 5000);
         RpcServerUnregisterIf(WitcherControl_v1_0_s_ifspec, nullptr, FALSE);
+
+        if (g_monitor_wakeup_event) {
+            SetEvent(g_monitor_wakeup_event);
+        }
+
+        if (g_monitor_thread) {
+            WaitForSingleObject(g_monitor_thread, 5000);
+            CloseHandle(g_monitor_thread);
+            g_monitor_thread = nullptr;
+        }
+
+        if (g_schedule_thread) {
+            WaitForSingleObject(g_schedule_thread, 5000);
+            CloseHandle(g_schedule_thread);
+            g_schedule_thread = nullptr;
+        }
 
         if (g_license_thread) {
             WaitForSingleObject(g_license_thread, 5000);
@@ -1012,12 +1188,19 @@ namespace {
 
         TerminateChildren();
 
+        if (g_monitor_wakeup_event) {
+            CloseHandle(g_monitor_wakeup_event);
+            g_monitor_wakeup_event = nullptr;
+        }
+
         CloseHandle(g_stop_event);
         g_stop_event = nullptr;
 
         witcher_av::FreeAvEngine();
         witcher::FreeLicenseState();
         witcher::FreeAuthState();
+
+        DeleteCriticalSection(&g_av_options_lock);
         DeleteCriticalSection(&g_process_lock);
 
         SetServiceStatusValue(SERVICE_STOPPED);
@@ -1127,15 +1310,8 @@ extern "C" long RpcLogin(const wchar_t* username, const wchar_t* password) {
     long long access_expires_at_unix = 0;
     long long refresh_expires_at_unix = 0;
 
-    witcher::GetJwtExpirationUnix(
-        login_result.accessToken,
-        &access_expires_at_unix
-    );
-
-    witcher::GetJwtExpirationUnix(
-        login_result.refreshToken,
-        &refresh_expires_at_unix
-    );
+    witcher::GetJwtExpirationUnix(login_result.accessToken, &access_expires_at_unix);
+    witcher::GetJwtExpirationUnix(login_result.refreshToken, &refresh_expires_at_unix);
 
     witcher::SetAuthTokens(
         login_result.username,
@@ -1488,17 +1664,14 @@ extern "C" long RpcScanFile(
         return ERROR_FILE_NOT_FOUND;
     }
 
-    *isMalicious = result.malicious ? 1 : 0;
-    *scannedFiles = result.scannedFiles;
-    *maliciousFiles = result.maliciousFiles;
-
-    if (!CopyStringToRpcBuffer(
-        result.threatName,
+    CopyScanResultToRpcOutputs(
+        result,
+        isMalicious,
         threatNameBuffer,
-        threatNameCapacity
-    )) {
-        return ERROR_INVALID_PARAMETER;
-    }
+        threatNameCapacity,
+        scannedFiles,
+        maliciousFiles
+    );
 
     return ERROR_SUCCESS;
 }
@@ -1535,17 +1708,180 @@ extern "C" long RpcScanDirectory(
         return ERROR_PATH_NOT_FOUND;
     }
 
-    *isMalicious = result.malicious ? 1 : 0;
-    *scannedFiles = result.scannedFiles;
-    *maliciousFiles = result.maliciousFiles;
-
-    if (!CopyStringToRpcBuffer(
-        result.threatName,
+    CopyScanResultToRpcOutputs(
+        result,
+        isMalicious,
         threatNameBuffer,
-        threatNameCapacity
-    )) {
+        threatNameCapacity,
+        scannedFiles,
+        maliciousFiles
+    );
+
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcScanFixedDrives(
+    long* isMalicious,
+    wchar_t* threatNameBuffer,
+    unsigned long threatNameCapacity,
+    unsigned long long* scannedFiles,
+    unsigned long long* maliciousFiles
+) {
+    if (!isMalicious || !threatNameBuffer ||
+        threatNameCapacity == 0 || !scannedFiles || !maliciousFiles) {
         return ERROR_INVALID_PARAMETER;
     }
+
+    *isMalicious = 0;
+    *scannedFiles = 0;
+    *maliciousFiles = 0;
+    threatNameBuffer[0] = L'\0';
+
+    if (!witcher::HasLicenseTicket()) {
+        return witcher::kErrorNoLicense;
+    }
+
+    if (!witcher_av::IsDatabaseLoaded()) {
+        witcher_av::LoadDefaultDatabase();
+    }
+
+    witcher_av::ScanResult result{};
+
+    if (!witcher_av::ScanFixedDrives(&result)) {
+        return ERROR_FUNCTION_FAILED;
+    }
+
+    CopyScanResultToRpcOutputs(
+        result,
+        isMalicious,
+        threatNameBuffer,
+        threatNameCapacity,
+        scannedFiles,
+        maliciousFiles
+    );
+
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcSetScheduledScan(
+    long isEnabled,
+    unsigned long intervalSeconds
+) {
+    if (intervalSeconds == 0) {
+        intervalSeconds = 10;
+    }
+
+    EnterCriticalSection(&g_av_options_lock);
+
+    g_scheduled_scan_enabled = isEnabled != 0;
+    g_scheduled_scan_interval_seconds = intervalSeconds;
+
+    if (!g_scheduled_scan_enabled) {
+        g_scheduled_scan_last_result = witcher_av::ScanResult{};
+    }
+
+    LeaveCriticalSection(&g_av_options_lock);
+
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcGetScheduledScanStatus(
+    long* isEnabled,
+    unsigned long* intervalSeconds,
+    unsigned long long* lastScannedFiles,
+    unsigned long long* lastMaliciousFiles,
+    long* lastIsMalicious,
+    wchar_t* lastThreatNameBuffer,
+    unsigned long threatNameCapacity
+) {
+    if (!isEnabled || !intervalSeconds || !lastScannedFiles ||
+        !lastMaliciousFiles || !lastIsMalicious ||
+        !lastThreatNameBuffer || threatNameCapacity == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    EnterCriticalSection(&g_av_options_lock);
+
+    *isEnabled = g_scheduled_scan_enabled ? 1 : 0;
+    *intervalSeconds = g_scheduled_scan_interval_seconds;
+
+    CopyScanResultToRpcOutputs(
+        g_scheduled_scan_last_result,
+        lastIsMalicious,
+        lastThreatNameBuffer,
+        threatNameCapacity,
+        lastScannedFiles,
+        lastMaliciousFiles
+    );
+
+    LeaveCriticalSection(&g_av_options_lock);
+
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcSetMonitoredDirectory(
+    long isEnabled,
+    const wchar_t* directoryPath
+) {
+    if (isEnabled && (!directoryPath || directoryPath[0] == L'\0')) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    EnterCriticalSection(&g_av_options_lock);
+
+    g_monitoring_enabled = isEnabled != 0;
+    g_monitored_directory = directoryPath ? directoryPath : L"";
+
+    if (!g_monitoring_enabled) {
+        g_monitoring_last_result = witcher_av::ScanResult{};
+        g_monitored_directory.clear();
+    }
+
+    LeaveCriticalSection(&g_av_options_lock);
+
+    if (g_monitor_wakeup_event) {
+        SetEvent(g_monitor_wakeup_event);
+    }
+
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcGetMonitoredDirectoryStatus(
+    long* isEnabled,
+    wchar_t* directoryPathBuffer,
+    unsigned long directoryPathCapacity,
+    unsigned long long* lastScannedFiles,
+    unsigned long long* lastMaliciousFiles,
+    long* lastIsMalicious,
+    wchar_t* lastThreatNameBuffer,
+    unsigned long threatNameCapacity
+) {
+    if (!isEnabled || !directoryPathBuffer || directoryPathCapacity == 0 ||
+        !lastScannedFiles || !lastMaliciousFiles || !lastIsMalicious ||
+        !lastThreatNameBuffer || threatNameCapacity == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    EnterCriticalSection(&g_av_options_lock);
+
+    *isEnabled = g_monitoring_enabled ? 1 : 0;
+
+    CopyStringToRpcBuffer(
+        g_monitored_directory,
+        directoryPathBuffer,
+        directoryPathCapacity
+    );
+
+    CopyScanResultToRpcOutputs(
+        g_monitoring_last_result,
+        lastIsMalicious,
+        lastThreatNameBuffer,
+        threatNameCapacity,
+        lastScannedFiles,
+        lastMaliciousFiles
+    );
+
+    LeaveCriticalSection(&g_av_options_lock);
 
     return ERROR_SUCCESS;
 }

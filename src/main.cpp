@@ -42,6 +42,11 @@ namespace {
     constexpr int kControlRefreshButton = 2007;
     constexpr int kControlScanFileButton = 2008;
     constexpr int kControlScanDirectoryButton = 2009;
+    constexpr int kControlScanDrivesButton = 2010;
+    constexpr int kControlEnableScheduleButton = 2011;
+    constexpr int kControlDisableScheduleButton = 2012;
+    constexpr int kControlEnableMonitorButton = 2013;
+    constexpr int kControlDisableMonitorButton = 2014;
 
     constexpr UINT_PTR kLicensePollTimerId = 3001;
     constexpr UINT kLicensePollIntervalMs = 30000;
@@ -70,6 +75,8 @@ namespace {
     std::wstring g_license_expiration_date;
     std::wstring g_av_database_release_date;
     std::wstring g_last_scan_result_text;
+    std::wstring g_schedule_status_text;
+    std::wstring g_monitor_status_text;
     std::wstring g_last_error_text;
 
     unsigned long long g_av_database_record_count = 0;
@@ -505,6 +512,72 @@ namespace {
         return control;
     }
 
+    std::wstring SelectFileForScan(HWND owner) {
+        wchar_t file_path[MAX_PATH]{};
+
+        OPENFILENAMEW open_file{};
+        open_file.lStructSize = sizeof(open_file);
+        open_file.hwndOwner = owner;
+        open_file.lpstrFile = file_path;
+        open_file.nMaxFile = _countof(file_path);
+        open_file.lpstrFilter = L"All files\0*.*\0";
+        open_file.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+        if (!GetOpenFileNameW(&open_file)) {
+            return {};
+        }
+
+        return file_path;
+    }
+
+    std::wstring SelectDirectoryForScan(HWND owner) {
+        BROWSEINFOW browse{};
+        browse.hwndOwner = owner;
+        browse.lpszTitle = L"Select directory";
+        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+        PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
+
+        if (!item) {
+            return {};
+        }
+
+        wchar_t path[MAX_PATH]{};
+
+        if (!SHGetPathFromIDListW(item, path)) {
+            CoTaskMemFree(item);
+            return {};
+        }
+
+        CoTaskMemFree(item);
+        return path;
+    }
+
+    std::wstring FormatScanResult(
+        const wchar_t* prefix,
+        long is_malicious,
+        const wchar_t* threat_name,
+        unsigned long long scanned_files,
+        unsigned long long malicious_files
+    ) {
+        std::wstring text = prefix;
+
+        if (is_malicious) {
+            text += L": MALICIOUS. Threat: ";
+            text += threat_name && threat_name[0] ? threat_name : L"unknown";
+        }
+        else {
+            text += L": clean";
+        }
+
+        text += L". Scanned files: ";
+        text += std::to_wstring(scanned_files);
+        text += L". Malicious files: ";
+        text += std::to_wstring(malicious_files);
+
+        return text;
+    }
+
     bool RpcGetCurrentUserSafe() {
         if (!ConnectRpc()) {
             g_last_error_text = L"Cannot connect to service RPC.";
@@ -611,139 +684,6 @@ namespace {
         return true;
     }
 
-    bool RpcScanFileSafe(const std::wstring& path) {
-        if (!ConnectRpc()) {
-            g_last_error_text = L"Cannot connect to service RPC.";
-            return false;
-        }
-
-        long is_malicious = 0;
-        unsigned long long scanned_files = 0;
-        unsigned long long malicious_files = 0;
-        wchar_t threat_name_buffer[256]{};
-
-        long result = RpcScanFile(
-            path.c_str(),
-            &is_malicious,
-            threat_name_buffer,
-            static_cast<unsigned long>(_countof(threat_name_buffer)),
-            &scanned_files,
-            &malicious_files
-        );
-
-        DisconnectRpc();
-
-        if (result != ERROR_SUCCESS) {
-            g_last_error_text = L"File scan failed. " + ErrorCodeToText(result);
-            return false;
-        }
-
-        if (is_malicious) {
-            g_last_scan_result_text =
-                L"File scan result: MALICIOUS. Threat: " +
-                std::wstring(threat_name_buffer) +
-                L". Scanned files: " +
-                std::to_wstring(scanned_files) +
-                L". Malicious files: " +
-                std::to_wstring(malicious_files);
-        }
-        else {
-            g_last_scan_result_text =
-                L"File scan result: clean. Scanned files: " +
-                std::to_wstring(scanned_files);
-        }
-
-        g_last_error_text.clear();
-        return true;
-    }
-
-    bool RpcScanDirectorySafe(const std::wstring& path) {
-        if (!ConnectRpc()) {
-            g_last_error_text = L"Cannot connect to service RPC.";
-            return false;
-        }
-
-        long is_malicious = 0;
-        unsigned long long scanned_files = 0;
-        unsigned long long malicious_files = 0;
-        wchar_t threat_name_buffer[256]{};
-
-        long result = RpcScanDirectory(
-            path.c_str(),
-            &is_malicious,
-            threat_name_buffer,
-            static_cast<unsigned long>(_countof(threat_name_buffer)),
-            &scanned_files,
-            &malicious_files
-        );
-
-        DisconnectRpc();
-
-        if (result != ERROR_SUCCESS) {
-            g_last_error_text = L"Directory scan failed. " + ErrorCodeToText(result);
-            return false;
-        }
-
-        if (is_malicious) {
-            g_last_scan_result_text =
-                L"Directory scan result: MALICIOUS. Threat: " +
-                std::wstring(threat_name_buffer) +
-                L". Scanned files: " +
-                std::to_wstring(scanned_files) +
-                L". Malicious files: " +
-                std::to_wstring(malicious_files);
-        }
-        else {
-            g_last_scan_result_text =
-                L"Directory scan result: clean. Scanned files: " +
-                std::to_wstring(scanned_files);
-        }
-
-        g_last_error_text.clear();
-        return true;
-    }
-
-    std::wstring SelectFileForScan(HWND owner) {
-        wchar_t file_path[MAX_PATH]{};
-
-        OPENFILENAMEW open_file{};
-        open_file.lStructSize = sizeof(open_file);
-        open_file.hwndOwner = owner;
-        open_file.lpstrFile = file_path;
-        open_file.nMaxFile = _countof(file_path);
-        open_file.lpstrFilter = L"All files\0*.*\0";
-        open_file.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-
-        if (!GetOpenFileNameW(&open_file)) {
-            return {};
-        }
-
-        return file_path;
-    }
-
-    std::wstring SelectDirectoryForScan(HWND owner) {
-        BROWSEINFOW browse{};
-        browse.hwndOwner = owner;
-        browse.lpszTitle = L"Select directory to scan";
-        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-
-        PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
-
-        if (!item) {
-            return {};
-        }
-
-        wchar_t path[MAX_PATH]{};
-
-        if (!SHGetPathFromIDListW(item, path)) {
-            CoTaskMemFree(item);
-            return {};
-        }
-
-        CoTaskMemFree(item);
-        return path;
-    }
-
     bool RpcLoginSafe(
         const std::wstring& username,
         const std::wstring& password
@@ -835,6 +775,305 @@ namespace {
         return true;
     }
 
+    bool RpcScanFileSafe(const std::wstring& path) {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long is_malicious = 0;
+        unsigned long long scanned_files = 0;
+        unsigned long long malicious_files = 0;
+        wchar_t threat_name_buffer[256]{};
+
+        long result = RpcScanFile(
+            path.c_str(),
+            &is_malicious,
+            threat_name_buffer,
+            static_cast<unsigned long>(_countof(threat_name_buffer)),
+            &scanned_files,
+            &malicious_files
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"File scan failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_last_scan_result_text = FormatScanResult(
+            L"File scan result",
+            is_malicious,
+            threat_name_buffer,
+            scanned_files,
+            malicious_files
+        );
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcScanDirectorySafe(const std::wstring& path) {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long is_malicious = 0;
+        unsigned long long scanned_files = 0;
+        unsigned long long malicious_files = 0;
+        wchar_t threat_name_buffer[256]{};
+
+        long result = RpcScanDirectory(
+            path.c_str(),
+            &is_malicious,
+            threat_name_buffer,
+            static_cast<unsigned long>(_countof(threat_name_buffer)),
+            &scanned_files,
+            &malicious_files
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Directory scan failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_last_scan_result_text = FormatScanResult(
+            L"Directory scan result",
+            is_malicious,
+            threat_name_buffer,
+            scanned_files,
+            malicious_files
+        );
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcScanFixedDrivesSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long is_malicious = 0;
+        unsigned long long scanned_files = 0;
+        unsigned long long malicious_files = 0;
+        wchar_t threat_name_buffer[256]{};
+
+        long result = RpcScanFixedDrives(
+            &is_malicious,
+            threat_name_buffer,
+            static_cast<unsigned long>(_countof(threat_name_buffer)),
+            &scanned_files,
+            &malicious_files
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Fixed drives scan failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_last_scan_result_text = FormatScanResult(
+            L"Fixed drives scan result",
+            is_malicious,
+            threat_name_buffer,
+            scanned_files,
+            malicious_files
+        );
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcEnableScheduleSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcSetScheduledScan(1, 1);
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Enable scheduled scan failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_schedule_status_text = L"Scheduled scan enabled. Interval: 1 minute.";
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcDisableScheduleSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcSetScheduledScan(0, 1);
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Disable scheduled scan failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_schedule_status_text = L"Scheduled scan disabled.";
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcRefreshScheduleStatusSafe() {
+        if (!ConnectRpc()) {
+            return false;
+        }
+
+        long is_enabled = 0;
+        unsigned long interval_minutes = 0;
+        unsigned long long scanned_files = 0;
+        unsigned long long malicious_files = 0;
+        long is_malicious = 0;
+        wchar_t threat_name_buffer[256]{};
+
+        long result = RpcGetScheduledScanStatus(
+            &is_enabled,
+            &interval_minutes,
+            &scanned_files,
+            &malicious_files,
+            &is_malicious,
+            threat_name_buffer,
+            static_cast<unsigned long>(_countof(threat_name_buffer))
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            return false;
+        }
+
+        g_schedule_status_text =
+            std::wstring(L"Schedule: ") +
+            (is_enabled ? L"enabled" : L"disabled") +
+            L", interval: " +
+            std::to_wstring(interval_minutes) +
+            L" min, last scanned: " +
+            std::to_wstring(scanned_files) +
+            L", last malicious: " +
+            std::to_wstring(malicious_files);
+
+        if (is_malicious) {
+            g_schedule_status_text += L", threat: ";
+            g_schedule_status_text += threat_name_buffer;
+        }
+
+        return true;
+    }
+
+    bool RpcEnableMonitorSafe(HWND hwnd) {
+        std::wstring path = SelectDirectoryForScan(hwnd);
+
+        if (path.empty()) {
+            return false;
+        }
+
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcSetMonitoredDirectory(1, path.c_str());
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Enable directory monitoring failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_monitor_status_text = L"Monitoring enabled: " + path;
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcDisableMonitorSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcSetMonitoredDirectory(0, L"");
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Disable directory monitoring failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_monitor_status_text = L"Monitoring disabled.";
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcRefreshMonitorStatusSafe() {
+        if (!ConnectRpc()) {
+            return false;
+        }
+
+        long is_enabled = 0;
+        wchar_t directory_path_buffer[MAX_PATH]{};
+        unsigned long long scanned_files = 0;
+        unsigned long long malicious_files = 0;
+        long is_malicious = 0;
+        wchar_t threat_name_buffer[256]{};
+
+        long result = RpcGetMonitoredDirectoryStatus(
+            &is_enabled,
+            directory_path_buffer,
+            static_cast<unsigned long>(_countof(directory_path_buffer)),
+            &scanned_files,
+            &malicious_files,
+            &is_malicious,
+            threat_name_buffer,
+            static_cast<unsigned long>(_countof(threat_name_buffer))
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            return false;
+        }
+
+        g_monitor_status_text =
+            std::wstring(L"Monitoring: ") +
+            (is_enabled ? L"enabled" : L"disabled");
+
+        if (is_enabled) {
+            g_monitor_status_text += L", dir: ";
+            g_monitor_status_text += directory_path_buffer;
+        }
+
+        g_monitor_status_text += L", last scanned: ";
+        g_monitor_status_text += std::to_wstring(scanned_files);
+        g_monitor_status_text += L", last malicious: ";
+        g_monitor_status_text += std::to_wstring(malicious_files);
+
+        if (is_malicious) {
+            g_monitor_status_text += L", threat: ";
+            g_monitor_status_text += threat_name_buffer;
+        }
+
+        return true;
+    }
+
     void RefreshApplicationState();
 
     void BuildLoginView(HWND hwnd) {
@@ -853,7 +1092,7 @@ namespace {
         AddButton(hwnd, kControlLoginButton, L"Login", 165, 180, 120, 32);
 
         if (!g_last_error_text.empty()) {
-            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 235, 540, 28);
+            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 235, 620, 28);
         }
 
         InvalidateRect(hwnd, nullptr, TRUE);
@@ -864,8 +1103,8 @@ namespace {
 
         std::wstring title = L"User: " + g_username;
 
-        AddStaticText(hwnd, title.c_str(), 40, 35, 500, 24);
-        AddStaticText(hwnd, L"No active license. Antivirus functionality is blocked.", 40, 75, 540, 24);
+        AddStaticText(hwnd, title.c_str(), 40, 35, 620, 24);
+        AddStaticText(hwnd, L"No active license. Antivirus functionality is blocked.", 40, 75, 620, 24);
         AddStaticText(hwnd, L"License code:", 40, 130, 120, 24);
 
         AddEdit(hwnd, kControlLicenseCodeEdit, 165, 126, 320, 28);
@@ -874,7 +1113,7 @@ namespace {
         AddButton(hwnd, kControlRefreshButton, L"Refresh", 435, 175, 120, 32);
 
         if (!g_last_error_text.empty()) {
-            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 235, 540, 28);
+            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 235, 620, 28);
         }
 
         InvalidateRect(hwnd, nullptr, TRUE);
@@ -907,22 +1146,36 @@ namespace {
             av_database_text += L"not loaded";
         }
 
-        AddStaticText(hwnd, username_text.c_str(), 40, 35, 560, 24);
-        AddStaticText(hwnd, L"Antivirus functionality is unlocked.", 40, 75, 560, 24);
-        AddStaticText(hwnd, license_text.c_str(), 40, 115, 560, 24);
-        AddStaticText(hwnd, av_database_text.c_str(), 40, 155, 560, 24);
+        AddStaticText(hwnd, username_text.c_str(), 40, 25, 720, 22);
+        AddStaticText(hwnd, L"Antivirus functionality is unlocked.", 40, 55, 720, 22);
+        AddStaticText(hwnd, license_text.c_str(), 40, 85, 720, 22);
+        AddStaticText(hwnd, av_database_text.c_str(), 40, 115, 720, 22);
 
-        AddButton(hwnd, kControlRefreshButton, L"Refresh status", 40, 205, 140, 32);
-        AddButton(hwnd, kControlScanFileButton, L"Scan file", 200, 205, 120, 32);
-        AddButton(hwnd, kControlScanDirectoryButton, L"Scan folder", 340, 205, 120, 32);
-        AddButton(hwnd, kControlLogoutButton, L"Logout", 480, 205, 100, 32);
+        AddButton(hwnd, kControlRefreshButton, L"Refresh", 40, 155, 100, 30);
+        AddButton(hwnd, kControlScanFileButton, L"Scan file", 155, 155, 110, 30);
+        AddButton(hwnd, kControlScanDirectoryButton, L"Scan folder", 280, 155, 120, 30);
+        AddButton(hwnd, kControlScanDrivesButton, L"Scan drives", 415, 155, 120, 30);
+        AddButton(hwnd, kControlLogoutButton, L"Logout", 550, 155, 100, 30);
+
+        AddButton(hwnd, kControlEnableScheduleButton, L"Enable schedule", 40, 200, 140, 30);
+        AddButton(hwnd, kControlDisableScheduleButton, L"Disable schedule", 195, 200, 150, 30);
+        AddButton(hwnd, kControlEnableMonitorButton, L"Monitor folder", 360, 200, 130, 30);
+        AddButton(hwnd, kControlDisableMonitorButton, L"Stop monitor", 505, 200, 120, 30);
 
         if (!g_last_scan_result_text.empty()) {
-            AddStaticText(hwnd, g_last_scan_result_text.c_str(), 40, 260, 560, 48);
+            AddStaticText(hwnd, g_last_scan_result_text.c_str(), 40, 250, 720, 45);
+        }
+
+        if (!g_schedule_status_text.empty()) {
+            AddStaticText(hwnd, g_schedule_status_text.c_str(), 40, 300, 720, 45);
+        }
+
+        if (!g_monitor_status_text.empty()) {
+            AddStaticText(hwnd, g_monitor_status_text.c_str(), 40, 350, 720, 45);
         }
 
         if (!g_last_error_text.empty()) {
-            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 320, 560, 48);
+            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 400, 720, 45);
         }
 
         InvalidateRect(hwnd, nullptr, TRUE);
@@ -975,6 +1228,8 @@ namespace {
         }
 
         RpcGetAvDatabaseInfoSafe();
+        RpcRefreshScheduleStatusSafe();
+        RpcRefreshMonitorStatusSafe();
 
         g_ui_state = UiState::Main;
         BuildCurrentView(g_main_window);
@@ -1070,6 +1325,8 @@ namespace {
         g_license_expiration_date.clear();
         g_av_database_release_date.clear();
         g_last_scan_result_text.clear();
+        g_schedule_status_text.clear();
+        g_monitor_status_text.clear();
 
         g_ui_state = UiState::Login;
         BuildCurrentView(hwnd);
@@ -1119,14 +1376,6 @@ namespace {
         g_tray_icon.uVersion = NOTIFYICON_VERSION_4;
 
         Shell_NotifyIconW(NIM_SETVERSION, &g_tray_icon);
-    }
-
-    void ExitApplication() {
-        g_is_exiting = true;
-        KillTimer(g_main_window, kLicensePollTimerId);
-        ClearChildControls();
-        RemoveTrayIcon();
-        PostQuitMessage(0);
     }
 
     void StopServiceAndExit() {
@@ -1200,8 +1449,8 @@ namespace {
         SetTextColor(hdc, RGB(230, 230, 230));
 
         RECT title_rect = rect;
-        title_rect.top = 360;
-        title_rect.bottom = 410;
+        title_rect.top = 455;
+        title_rect.bottom = 500;
 
         DrawTextW(
             hdc,
@@ -1301,6 +1550,35 @@ namespace {
                 return 0;
             }
 
+            case kControlScanDrivesButton:
+                RpcScanFixedDrivesSafe();
+                BuildCurrentView(hwnd);
+                return 0;
+
+            case kControlEnableScheduleButton:
+                RpcEnableScheduleSafe();
+                RpcRefreshScheduleStatusSafe();
+                BuildCurrentView(hwnd);
+                return 0;
+
+            case kControlDisableScheduleButton:
+                RpcDisableScheduleSafe();
+                RpcRefreshScheduleStatusSafe();
+                BuildCurrentView(hwnd);
+                return 0;
+
+            case kControlEnableMonitorButton:
+                RpcEnableMonitorSafe(hwnd);
+                RpcRefreshMonitorStatusSafe();
+                BuildCurrentView(hwnd);
+                return 0;
+
+            case kControlDisableMonitorButton:
+                RpcDisableMonitorSafe();
+                RpcRefreshMonitorStatusSafe();
+                BuildCurrentView(hwnd);
+                return 0;
+
             case kMenuExit:
                 StopServiceAndExit();
                 return 0;
@@ -1359,8 +1637,8 @@ namespace {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            700,
-            460,
+            820,
+            560,
             nullptr,
             CreateMainMenu(),
             g_instance,
@@ -1436,4 +1714,4 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     }
 
     return static_cast<int>(message.wParam);
-}   
+}

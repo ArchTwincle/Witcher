@@ -19,6 +19,7 @@ namespace witcher_av {
         unsigned long long objectSignaturePrefix = 0;
         unsigned long objectSignatureLength = 0;
         std::vector<unsigned char> objectSignature;
+        std::vector<unsigned char> rawSignature;
         unsigned long long offsetBegin = 0;
         unsigned long long offsetEnd = 0;
         AvObjectType objectType = AvObjectType::Unknown;
@@ -58,6 +59,10 @@ namespace witcher_av {
 
     bool ScanDirectory(
         const std::wstring& path,
+        ScanResult* result
+    );
+
+    bool ScanFixedDrives(
         ScanResult* result
     );
 

@@ -5,11 +5,13 @@
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
+#include <queue>
 #include <sstream>
-#include <filesystem>
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -22,8 +24,16 @@ namespace witcher_av {
 
         using AvTree = std::map<unsigned long long, std::vector<AvRecord>>;
 
+        struct AhoNode {
+            std::map<unsigned char, int> next;
+            int fail = 0;
+            std::vector<size_t> outputRecordIndexes;
+        };
+
         std::mutex g_database_lock;
         AvTree g_database;
+        std::vector<AvRecord> g_flat_records;
+        std::vector<AhoNode> g_aho_nodes;
         bool g_database_loaded = false;
         std::wstring g_release_date = L"2026-05-14";
 
@@ -93,12 +103,16 @@ namespace witcher_av {
                 return false;
             }
 
-            BOOL hashed = CryptHashData(
-                hash_handle,
-                data.data(),
-                static_cast<DWORD>(data.size()),
-                0
-            );
+            BOOL hashed = TRUE;
+
+            if (!data.empty()) {
+                hashed = CryptHashData(
+                    hash_handle,
+                    data.data(),
+                    static_cast<DWORD>(data.size()),
+                    0
+                );
+            }
 
             if (!hashed) {
                 CryptDestroyHash(hash_handle);
@@ -178,6 +192,7 @@ namespace witcher_av {
 
             std::vector<unsigned char> signature_bytes = ToBytes(signature_text);
 
+            record.rawSignature = signature_bytes;
             record.objectSignaturePrefix = ReadPrefixFromBytes(signature_bytes, 0);
             record.objectSignatureLength = static_cast<unsigned long>(signature_bytes.size());
             record.offsetBegin = offset_begin;
@@ -193,6 +208,81 @@ namespace witcher_av {
 
         void AddRecordUnlocked(const AvRecord& record) {
             g_database[record.objectSignaturePrefix].push_back(record);
+            g_flat_records.push_back(record);
+        }
+
+        void BuildAhoCorasickUnlocked() {
+            g_aho_nodes.clear();
+            g_aho_nodes.push_back(AhoNode{});
+
+            for (size_t record_index = 0; record_index < g_flat_records.size(); ++record_index) {
+                const AvRecord& record = g_flat_records[record_index];
+
+                if (record.rawSignature.empty()) {
+                    continue;
+                }
+
+                int node = 0;
+
+                for (unsigned char ch : record.rawSignature) {
+                    auto found = g_aho_nodes[node].next.find(ch);
+
+                    if (found == g_aho_nodes[node].next.end()) {
+                        int new_node = static_cast<int>(g_aho_nodes.size());
+                        g_aho_nodes[node].next[ch] = new_node;
+                        g_aho_nodes.push_back(AhoNode{});
+                        node = new_node;
+                    }
+                    else {
+                        node = found->second;
+                    }
+                }
+
+                g_aho_nodes[node].outputRecordIndexes.push_back(record_index);
+            }
+
+            std::queue<int> queue;
+
+            for (const auto& edge : g_aho_nodes[0].next) {
+                int child = edge.second;
+                g_aho_nodes[child].fail = 0;
+                queue.push(child);
+            }
+
+            while (!queue.empty()) {
+                int current = queue.front();
+                queue.pop();
+
+                for (const auto& edge : g_aho_nodes[current].next) {
+                    unsigned char ch = edge.first;
+                    int child = edge.second;
+
+                    int fallback = g_aho_nodes[current].fail;
+
+                    while (fallback != 0 &&
+                        g_aho_nodes[fallback].next.find(ch) == g_aho_nodes[fallback].next.end()) {
+                        fallback = g_aho_nodes[fallback].fail;
+                    }
+
+                    auto found = g_aho_nodes[fallback].next.find(ch);
+
+                    if (found != g_aho_nodes[fallback].next.end()) {
+                        g_aho_nodes[child].fail = found->second;
+                    }
+                    else {
+                        g_aho_nodes[child].fail = 0;
+                    }
+
+                    const auto& fail_outputs = g_aho_nodes[g_aho_nodes[child].fail].outputRecordIndexes;
+                    g_aho_nodes[child].outputRecordIndexes.insert(
+                        g_aho_nodes[child].outputRecordIndexes.end(),
+                        fail_outputs.begin(),
+                        fail_outputs.end()
+                    );
+
+                    queue.push(child);
+                }
+            }
         }
 
         bool ReadFileBytes(
@@ -307,25 +397,42 @@ namespace witcher_av {
             );
         }
 
-        bool ScanBytesUnlocked(
+        bool VerifyRecordWithHash(
+            const AvRecord& record,
+            const std::vector<unsigned char>& bytes,
+            size_t position
+        ) {
+            if (record.objectSignatureLength < 8) {
+                return false;
+            }
+
+            size_t full_length = static_cast<size_t>(record.objectSignatureLength);
+
+            if (position + full_length > bytes.size()) {
+                return false;
+            }
+
+            std::vector<unsigned char> candidate(
+                bytes.begin() + static_cast<std::ptrdiff_t>(position),
+                bytes.begin() + static_cast<std::ptrdiff_t>(position + full_length)
+            );
+
+            std::vector<unsigned char> candidate_hash;
+
+            if (!ComputeSha256(candidate, &candidate_hash)) {
+                return false;
+            }
+
+            return candidate_hash == record.objectSignature;
+        }
+
+        bool ScanBytesWithMapUnlocked(
             const std::wstring& path,
             const std::vector<unsigned char>& bytes,
             ScanResult* result
         ) {
             if (!result) {
                 return false;
-            }
-
-            result->scanned = true;
-            result->malicious = false;
-            result->offset = 0;
-            result->threatName[0] = L'\0';
-            result->objectPath[0] = L'\0';
-
-            CopyWideString(path, result->objectPath, _countof(result->objectPath));
-
-            if (!g_database_loaded || bytes.size() < 8) {
-                return true;
             }
 
             AvObjectType object_type = DetectObjectType(path, bytes);
@@ -353,34 +460,15 @@ namespace witcher_av {
                         continue;
                     }
 
-                    if (record.objectSignatureLength < 8) {
+                    if (!VerifyRecordWithHash(record, bytes, position)) {
                         continue;
                     }
 
-                    size_t full_length = static_cast<size_t>(record.objectSignatureLength);
-
-                    if (position + full_length > bytes.size()) {
-                        continue;
-                    }
-
-                    std::vector<unsigned char> candidate(
-                        bytes.begin() + static_cast<std::ptrdiff_t>(position),
-                        bytes.begin() + static_cast<std::ptrdiff_t>(position + full_length)
-                    );
-
-                    std::vector<unsigned char> candidate_hash;
-
-                    if (!ComputeSha256(candidate, &candidate_hash)) {
-                        continue;
-                    }
-
-                    if (candidate_hash == record.objectSignature) {
-                        result->malicious = true;
-                        result->maliciousFiles = 1;
-                        result->offset = static_cast<unsigned long long>(position);
-                        CopyWideString(record.threatName, result->threatName, _countof(result->threatName));
-                        return true;
-                    }
+                    result->malicious = true;
+                    result->maliciousFiles = 1;
+                    result->offset = static_cast<unsigned long long>(position);
+                    CopyWideString(record.threatName, result->threatName, _countof(result->threatName));
+                    return true;
                 }
 
                 ++position;
@@ -389,9 +477,169 @@ namespace witcher_av {
             return true;
         }
 
+        bool ScanBytesWithAhoCorasickUnlocked(
+            const std::wstring& path,
+            const std::vector<unsigned char>& bytes,
+            ScanResult* result
+        ) {
+            if (!result) {
+                return false;
+            }
+
+            if (g_aho_nodes.empty()) {
+                return ScanBytesWithMapUnlocked(path, bytes, result);
+            }
+
+            AvObjectType object_type = DetectObjectType(path, bytes);
+            int node = 0;
+
+            for (size_t i = 0; i < bytes.size(); ++i) {
+                unsigned char ch = bytes[i];
+
+                while (node != 0 &&
+                    g_aho_nodes[node].next.find(ch) == g_aho_nodes[node].next.end()) {
+                    node = g_aho_nodes[node].fail;
+                }
+
+                auto found = g_aho_nodes[node].next.find(ch);
+
+                if (found != g_aho_nodes[node].next.end()) {
+                    node = found->second;
+                }
+                else {
+                    node = 0;
+                }
+
+                if (g_aho_nodes[node].outputRecordIndexes.empty()) {
+                    continue;
+                }
+
+                for (size_t record_index : g_aho_nodes[node].outputRecordIndexes) {
+                    if (record_index >= g_flat_records.size()) {
+                        continue;
+                    }
+
+                    const AvRecord& record = g_flat_records[record_index];
+
+                    if (record.rawSignature.size() > i + 1) {
+                        continue;
+                    }
+
+                    size_t position = i + 1 - record.rawSignature.size();
+
+                    if (record.objectType != object_type) {
+                        continue;
+                    }
+
+                    if (position < record.offsetBegin || position > record.offsetEnd) {
+                        continue;
+                    }
+
+                    if (!VerifyRecordWithHash(record, bytes, position)) {
+                        continue;
+                    }
+
+                    result->malicious = true;
+                    result->maliciousFiles = 1;
+                    result->offset = static_cast<unsigned long long>(position);
+                    CopyWideString(record.threatName, result->threatName, _countof(result->threatName));
+                    return true;
+                }
+            }
+
+            return true;
+        }
+
+        bool ScanBytesUnlocked(
+            const std::wstring& path,
+            const std::vector<unsigned char>& bytes,
+            ScanResult* result
+        ) {
+            if (!result) {
+                return false;
+            }
+
+            result->scanned = true;
+            result->malicious = false;
+            result->offset = 0;
+            result->threatName[0] = L'\0';
+            result->objectPath[0] = L'\0';
+
+            CopyWideString(path, result->objectPath, _countof(result->objectPath));
+
+            if (!g_database_loaded || bytes.size() < 8) {
+                return true;
+            }
+
+            return ScanBytesWithAhoCorasickUnlocked(path, bytes, result);
+        }
+
         bool IsRegularFile(const std::filesystem::directory_entry& entry) {
             std::error_code error;
             return entry.is_regular_file(error);
+        }
+
+        void MergeDirectoryResult(
+            ScanResult* total_result,
+            const ScanResult& local_result
+        ) {
+            if (!total_result) {
+                return;
+            }
+
+            if (local_result.malicious) {
+                total_result->malicious = true;
+                total_result->maliciousFiles += local_result.maliciousFiles;
+
+                if (total_result->threatName[0] == L'\0') {
+                    CopyWideString(local_result.threatName, total_result->threatName, _countof(total_result->threatName));
+                    CopyWideString(local_result.objectPath, total_result->objectPath, _countof(total_result->objectPath));
+                    total_result->offset = local_result.offset;
+                }
+            }
+        }
+
+        bool ScanDirectoryInternal(
+            const std::wstring& path,
+            ScanResult* result
+        ) {
+            if (!result) {
+                return false;
+            }
+
+            std::error_code error;
+
+            if (!std::filesystem::exists(path, error) ||
+                !std::filesystem::is_directory(path, error)) {
+                return false;
+            }
+
+            result->scanned = true;
+
+            std::filesystem::recursive_directory_iterator iterator(
+                path,
+                std::filesystem::directory_options::skip_permission_denied,
+                error
+            );
+
+            std::filesystem::recursive_directory_iterator end;
+
+            while (!error && iterator != end) {
+                const auto& entry = *iterator;
+
+                if (IsRegularFile(entry)) {
+                    ScanResult local_result{};
+                    ++result->scannedFiles;
+
+                    if (ScanFile(entry.path().wstring(), &local_result)) {
+                        MergeDirectoryResult(result, local_result);
+                    }
+                }
+
+                iterator.increment(error);
+            }
+
+            return true;
         }
 
     }
@@ -399,6 +647,8 @@ namespace witcher_av {
     void InitializeAvEngine() {
         std::lock_guard<std::mutex> guard(g_database_lock);
         g_database.clear();
+        g_flat_records.clear();
+        g_aho_nodes.clear();
         g_database_loaded = false;
         g_release_date = L"2026-05-14";
     }
@@ -406,6 +656,8 @@ namespace witcher_av {
     void FreeAvEngine() {
         std::lock_guard<std::mutex> guard(g_database_lock);
         g_database.clear();
+        g_flat_records.clear();
+        g_aho_nodes.clear();
         g_database_loaded = false;
     }
 
@@ -413,15 +665,8 @@ namespace witcher_av {
         std::lock_guard<std::mutex> guard(g_database_lock);
 
         g_database.clear();
-
-        /*
-            Demo in-memory AV database.
-
-            Test files:
-            - test.ps1 containing: WITCHER_SCRIPT_TEST_MALWARE
-            - test.js containing: WITCHER_JS_TEST_MALWARE
-            - test.exe-like file starting with MZ and containing: WITCHER_PE_TEST_MALWARE
-        */
+        g_flat_records.clear();
+        g_aho_nodes.clear();
 
         AddRecordUnlocked(MakeRecord(
             "WITCHER_SCRIPT_TEST_MALWARE",
@@ -447,6 +692,16 @@ namespace witcher_av {
             L"Witcher.Test.PE"
         ));
 
+        AddRecordUnlocked(MakeRecord(
+            "WITCHER_PY_TEST_MALWARE",
+            0,
+            kDefaultOffsetEnd,
+            AvObjectType::PythonScript,
+            L"Witcher.Test.Python"
+        ));
+
+        BuildAhoCorasickUnlocked();
+
         g_database_loaded = true;
         g_release_date = L"2026-05-14";
 
@@ -456,6 +711,8 @@ namespace witcher_av {
     void ClearDatabase() {
         std::lock_guard<std::mutex> guard(g_database_lock);
         g_database.clear();
+        g_flat_records.clear();
+        g_aho_nodes.clear();
         g_database_loaded = false;
     }
 
@@ -520,41 +777,52 @@ namespace witcher_av {
         }
 
         *result = ScanResult{};
+        return ScanDirectoryInternal(path, result);
+    }
 
-        std::error_code error;
-
-        if (!std::filesystem::exists(path, error) ||
-            !std::filesystem::is_directory(path, error)) {
+    bool ScanFixedDrives(
+        ScanResult* result
+    ) {
+        if (!result) {
             return false;
         }
 
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(path, error)) {
-            if (error) {
-                break;
-            }
+        *result = ScanResult{};
+        result->scanned = true;
 
-            if (!IsRegularFile(entry)) {
+        DWORD drives_mask = GetLogicalDrives();
+
+        if (drives_mask == 0) {
+            return false;
+        }
+
+        for (wchar_t letter = L'A'; letter <= L'Z'; ++letter) {
+            DWORD bit = 1u << (letter - L'A');
+
+            if ((drives_mask & bit) == 0) {
                 continue;
             }
 
-            ScanResult local_result{};
+            std::wstring root;
+            root.push_back(letter);
+            root += L":\\";
 
-            ++result->scannedFiles;
+            UINT drive_type = GetDriveTypeW(root.c_str());
 
-            if (ScanFile(entry.path().wstring(), &local_result) &&
-                local_result.malicious) {
-                result->scanned = true;
-                result->malicious = true;
-                result->maliciousFiles += 1;
-                result->offset = local_result.offset;
-                CopyWideString(local_result.threatName, result->threatName, _countof(result->threatName));
-                CopyWideString(local_result.objectPath, result->objectPath, _countof(result->objectPath));
-                return true;
+            if (drive_type != DRIVE_FIXED) {
+                continue;
             }
+
+            ScanResult drive_result{};
+
+            if (!ScanDirectory(root, &drive_result)) {
+                continue;
+            }
+
+            result->scannedFiles += drive_result.scannedFiles;
+            MergeDirectoryResult(result, drive_result);
         }
 
-        result->scanned = true;
-        result->malicious = false;
         return true;
     }
 
