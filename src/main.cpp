@@ -2,6 +2,8 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <rpc.h>
+#include <commdlg.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <string>
@@ -13,6 +15,9 @@
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "rpcrt4.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 handle_t WitcherControl_IfHandle = nullptr;
 
@@ -35,6 +40,8 @@ namespace {
     constexpr int kControlActivateButton = 2005;
     constexpr int kControlLogoutButton = 2006;
     constexpr int kControlRefreshButton = 2007;
+    constexpr int kControlScanFileButton = 2008;
+    constexpr int kControlScanDirectoryButton = 2009;
 
     constexpr UINT_PTR kLicensePollTimerId = 3001;
     constexpr UINT kLicensePollIntervalMs = 30000;
@@ -61,7 +68,12 @@ namespace {
 
     std::wstring g_username;
     std::wstring g_license_expiration_date;
+    std::wstring g_av_database_release_date;
+    std::wstring g_last_scan_result_text;
     std::wstring g_last_error_text;
+
+    unsigned long long g_av_database_record_count = 0;
+    bool g_av_database_loaded = false;
 
     std::vector<HWND> g_child_controls;
 
@@ -294,7 +306,6 @@ namespace {
         }
 
         CloseHandle(snapshot);
-
         return parent_pid;
     }
 
@@ -320,7 +331,6 @@ namespace {
         }
 
         CloseHandle(snapshot);
-
         return name;
     }
 
@@ -568,6 +578,172 @@ namespace {
         return true;
     }
 
+    bool RpcGetAvDatabaseInfoSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long is_loaded = 0;
+        unsigned long long record_count = 0;
+        wchar_t release_date_buffer[128]{};
+
+        long result = RpcGetAvDatabaseInfo(
+            &is_loaded,
+            release_date_buffer,
+            static_cast<unsigned long>(_countof(release_date_buffer)),
+            &record_count
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_av_database_loaded = false;
+            g_av_database_record_count = 0;
+            g_av_database_release_date.clear();
+            g_last_error_text = L"AV database info failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_av_database_loaded = is_loaded != 0;
+        g_av_database_record_count = record_count;
+        g_av_database_release_date = release_date_buffer;
+        return true;
+    }
+
+    bool RpcScanFileSafe(const std::wstring& path) {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long is_malicious = 0;
+        unsigned long long scanned_files = 0;
+        unsigned long long malicious_files = 0;
+        wchar_t threat_name_buffer[256]{};
+
+        long result = RpcScanFile(
+            path.c_str(),
+            &is_malicious,
+            threat_name_buffer,
+            static_cast<unsigned long>(_countof(threat_name_buffer)),
+            &scanned_files,
+            &malicious_files
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"File scan failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        if (is_malicious) {
+            g_last_scan_result_text =
+                L"File scan result: MALICIOUS. Threat: " +
+                std::wstring(threat_name_buffer) +
+                L". Scanned files: " +
+                std::to_wstring(scanned_files) +
+                L". Malicious files: " +
+                std::to_wstring(malicious_files);
+        }
+        else {
+            g_last_scan_result_text =
+                L"File scan result: clean. Scanned files: " +
+                std::to_wstring(scanned_files);
+        }
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcScanDirectorySafe(const std::wstring& path) {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long is_malicious = 0;
+        unsigned long long scanned_files = 0;
+        unsigned long long malicious_files = 0;
+        wchar_t threat_name_buffer[256]{};
+
+        long result = RpcScanDirectory(
+            path.c_str(),
+            &is_malicious,
+            threat_name_buffer,
+            static_cast<unsigned long>(_countof(threat_name_buffer)),
+            &scanned_files,
+            &malicious_files
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Directory scan failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        if (is_malicious) {
+            g_last_scan_result_text =
+                L"Directory scan result: MALICIOUS. Threat: " +
+                std::wstring(threat_name_buffer) +
+                L". Scanned files: " +
+                std::to_wstring(scanned_files) +
+                L". Malicious files: " +
+                std::to_wstring(malicious_files);
+        }
+        else {
+            g_last_scan_result_text =
+                L"Directory scan result: clean. Scanned files: " +
+                std::to_wstring(scanned_files);
+        }
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    std::wstring SelectFileForScan(HWND owner) {
+        wchar_t file_path[MAX_PATH]{};
+
+        OPENFILENAMEW open_file{};
+        open_file.lStructSize = sizeof(open_file);
+        open_file.hwndOwner = owner;
+        open_file.lpstrFile = file_path;
+        open_file.nMaxFile = _countof(file_path);
+        open_file.lpstrFilter = L"All files\0*.*\0";
+        open_file.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+        if (!GetOpenFileNameW(&open_file)) {
+            return {};
+        }
+
+        return file_path;
+    }
+
+    std::wstring SelectDirectoryForScan(HWND owner) {
+        BROWSEINFOW browse{};
+        browse.hwndOwner = owner;
+        browse.lpszTitle = L"Select directory to scan";
+        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+        PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
+
+        if (!item) {
+            return {};
+        }
+
+        wchar_t path[MAX_PATH]{};
+
+        if (!SHGetPathFromIDListW(item, path)) {
+            CoTaskMemFree(item);
+            return {};
+        }
+
+        CoTaskMemFree(item);
+        return path;
+    }
+
     bool RpcLoginSafe(
         const std::wstring& username,
         const std::wstring& password
@@ -717,15 +893,36 @@ namespace {
             license_text += L"unknown";
         }
 
-        AddStaticText(hwnd, username_text.c_str(), 40, 35, 520, 24);
-        AddStaticText(hwnd, L"Antivirus functionality is unlocked.", 40, 75, 520, 24);
-        AddStaticText(hwnd, license_text.c_str(), 40, 115, 520, 24);
+        std::wstring av_database_text = L"AV database: ";
 
-        AddButton(hwnd, kControlRefreshButton, L"Refresh status", 40, 170, 140, 32);
-        AddButton(hwnd, kControlLogoutButton, L"Logout", 200, 170, 120, 32);
+        if (g_av_database_loaded) {
+            av_database_text += L"loaded, release date: ";
+            av_database_text += g_av_database_release_date.empty()
+                ? L"unknown"
+                : g_av_database_release_date;
+            av_database_text += L", records: ";
+            av_database_text += std::to_wstring(g_av_database_record_count);
+        }
+        else {
+            av_database_text += L"not loaded";
+        }
+
+        AddStaticText(hwnd, username_text.c_str(), 40, 35, 560, 24);
+        AddStaticText(hwnd, L"Antivirus functionality is unlocked.", 40, 75, 560, 24);
+        AddStaticText(hwnd, license_text.c_str(), 40, 115, 560, 24);
+        AddStaticText(hwnd, av_database_text.c_str(), 40, 155, 560, 24);
+
+        AddButton(hwnd, kControlRefreshButton, L"Refresh status", 40, 205, 140, 32);
+        AddButton(hwnd, kControlScanFileButton, L"Scan file", 200, 205, 120, 32);
+        AddButton(hwnd, kControlScanDirectoryButton, L"Scan folder", 340, 205, 120, 32);
+        AddButton(hwnd, kControlLogoutButton, L"Logout", 480, 205, 100, 32);
+
+        if (!g_last_scan_result_text.empty()) {
+            AddStaticText(hwnd, g_last_scan_result_text.c_str(), 40, 260, 560, 48);
+        }
 
         if (!g_last_error_text.empty()) {
-            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 235, 540, 28);
+            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 320, 560, 48);
         }
 
         InvalidateRect(hwnd, nullptr, TRUE);
@@ -776,6 +973,8 @@ namespace {
             BuildCurrentView(g_main_window);
             return;
         }
+
+        RpcGetAvDatabaseInfoSafe();
 
         g_ui_state = UiState::Main;
         BuildCurrentView(g_main_window);
@@ -865,8 +1064,12 @@ namespace {
 
         g_is_authenticated = false;
         g_has_license = false;
+        g_av_database_loaded = false;
+        g_av_database_record_count = 0;
         g_username.clear();
         g_license_expiration_date.clear();
+        g_av_database_release_date.clear();
+        g_last_scan_result_text.clear();
 
         g_ui_state = UiState::Login;
         BuildCurrentView(hwnd);
@@ -928,16 +1131,6 @@ namespace {
 
     void StopServiceAndExit() {
         RequestServiceStop();
-
-        /*
-            Do not close the GUI immediately.
-
-            If the user confirms service stop on the private desktop,
-            the service will terminate all launched TrayWin32App.exe processes.
-
-            If the user clicks No or the confirmation cannot be shown,
-            the tray app remains running.
-        */
     }
 
     void ShowTrayMenu(HWND hwnd) {
@@ -1007,8 +1200,8 @@ namespace {
         SetTextColor(hdc, RGB(230, 230, 230));
 
         RECT title_rect = rect;
-        title_rect.top = 300;
-        title_rect.bottom = 360;
+        title_rect.top = 360;
+        title_rect.bottom = 410;
 
         DrawTextW(
             hdc,
@@ -1084,6 +1277,30 @@ namespace {
                 RefreshApplicationState();
                 return 0;
 
+            case kControlScanFileButton:
+            {
+                std::wstring path = SelectFileForScan(hwnd);
+
+                if (!path.empty()) {
+                    RpcScanFileSafe(path);
+                }
+
+                BuildCurrentView(hwnd);
+                return 0;
+            }
+
+            case kControlScanDirectoryButton:
+            {
+                std::wstring path = SelectDirectoryForScan(hwnd);
+
+                if (!path.empty()) {
+                    RpcScanDirectorySafe(path);
+                }
+
+                BuildCurrentView(hwnd);
+                return 0;
+            }
+
             case kMenuExit:
                 StopServiceAndExit();
                 return 0;
@@ -1142,8 +1359,8 @@ namespace {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            640,
-            420,
+            700,
+            460,
             nullptr,
             CreateMainMenu(),
             g_instance,
@@ -1219,4 +1436,4 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     }
 
     return static_cast<int>(message.wParam);
-}
+}   

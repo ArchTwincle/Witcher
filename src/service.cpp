@@ -16,6 +16,7 @@
 #include "http_client.h"
 #include "jwt_utils.h"
 #include "license_state.h"
+#include "av_engine.h"
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "rpcrt4.lib")
@@ -93,22 +94,6 @@ namespace {
         if (!process_handle) {
             return false;
         }
-
-        /*
-            Best-effort protection against process termination.
-
-            SYSTEM keeps full access because the service runs as LocalSystem
-            and must be able to manage itself and child processes.
-
-            Administrators, Users and Authenticated Users get explicit DENY
-            for PROCESS_TERMINATE and only limited read/sync rights.
-
-            Full protection against an elevated administrator is impossible
-            in ordinary user-mode code. An elevated administrator can use
-            SeDebugPrivilege, take ownership, rewrite DACLs, or use kernel-level
-            tools. True administrator-resistant protection requires a driver or
-            Windows Protected Process / Protected Process Light.
-        */
 
         constexpr DWORD kLimitedProcessReadRights =
             PROCESS_QUERY_LIMITED_INFORMATION |
@@ -189,7 +174,6 @@ namespace {
         );
 
         LocalFree(new_dacl);
-
         return result == ERROR_SUCCESS;
     }
 
@@ -205,9 +189,7 @@ namespace {
         }
 
         bool result = ConfigureProcessDacl(process_handle);
-
         CloseHandle(process_handle);
-
         return result;
     }
 
@@ -382,30 +364,25 @@ namespace {
     ) {
         std::string pattern = "\"" + key + "\"";
 
-        size_t keyPos = json.find(pattern);
-        if (keyPos == std::string::npos) {
+        size_t key_pos = json.find(pattern);
+        if (key_pos == std::string::npos) {
             return 0;
         }
 
-        size_t colonPos = json.find(':', keyPos);
-        if (colonPos == std::string::npos) {
+        size_t colon_pos = json.find(':', key_pos);
+        if (colon_pos == std::string::npos) {
             return 0;
         }
 
-        size_t numberStart = json.find_first_of("0123456789", colonPos + 1);
-        if (numberStart == std::string::npos) {
+        size_t number_start = json.find_first_of("0123456789", colon_pos + 1);
+        if (number_start == std::string::npos) {
             return 0;
         }
 
-        size_t numberEnd = json.find_first_not_of("0123456789", numberStart);
-
-        std::string numberText = json.substr(
-            numberStart,
-            numberEnd - numberStart
-        );
+        size_t number_end = json.find_first_not_of("0123456789", number_start);
 
         try {
-            return std::stoll(numberText);
+            return std::stoll(json.substr(number_start, number_end - number_start));
         }
         catch (...) {
             return 0;
@@ -418,61 +395,61 @@ namespace {
     ) {
         std::string pattern = "\"" + key + "\"";
 
-        size_t keyPos = json.find(pattern);
-        if (keyPos == std::string::npos) {
+        size_t key_pos = json.find(pattern);
+        if (key_pos == std::string::npos) {
             return {};
         }
 
-        size_t colonPos = json.find(':', keyPos);
-        if (colonPos == std::string::npos) {
+        size_t colon_pos = json.find(':', key_pos);
+        if (colon_pos == std::string::npos) {
             return {};
         }
 
-        size_t firstQuote = json.find('"', colonPos + 1);
-        if (firstQuote == std::string::npos) {
+        size_t first_quote = json.find('"', colon_pos + 1);
+        if (first_quote == std::string::npos) {
             return {};
         }
 
-        size_t secondQuote = json.find('"', firstQuote + 1);
-        if (secondQuote == std::string::npos) {
+        size_t second_quote = json.find('"', first_quote + 1);
+        if (second_quote == std::string::npos) {
             return {};
         }
 
-        return json.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+        return json.substr(first_quote + 1, second_quote - first_quote - 1);
     }
 
     void StoreLicenseTicket(
-        const std::string& licenseTicket,
-        const std::string& licenseCode,
-        const std::string& macAddress,
-        const std::string& productId
+        const std::string& license_ticket,
+        const std::string& license_code,
+        const std::string& mac_address,
+        const std::string& product_id
     ) {
-        long long ticketLifetimeSeconds = ExtractJsonNumber(
-            licenseTicket,
+        long long ticket_lifetime_seconds = ExtractJsonNumber(
+            license_ticket,
             "ticketLifetimeSeconds"
         );
 
-        std::string expirationDate = ExtractJsonString(
-            licenseTicket,
+        std::string expiration_date = ExtractJsonString(
+            license_ticket,
             "expirationDate"
         );
 
         witcher::SetLicenseTicket(
-            licenseTicket,
-            ticketLifetimeSeconds,
-            expirationDate,
-            licenseCode,
-            macAddress,
-            productId
+            license_ticket,
+            ticket_lifetime_seconds,
+            expiration_date,
+            license_code,
+            mac_address,
+            product_id
         );
     }
 
     bool CopyStringToRpcBuffer(
         const std::wstring& source,
         wchar_t* destination,
-        unsigned long destinationCapacity
+        unsigned long destination_capacity
     ) {
-        if (!destination || destinationCapacity == 0) {
+        if (!destination || destination_capacity == 0) {
             return false;
         }
 
@@ -484,7 +461,7 @@ namespace {
 
         wcsncpy_s(
             destination,
-            destinationCapacity,
+            destination_capacity,
             source.c_str(),
             _TRUNCATE
         );
@@ -641,9 +618,7 @@ namespace {
     DWORD WINAPI TokenRefreshThread(void*) {
         while (true) {
             if (!witcher::IsAuthenticated()) {
-                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
-
-                if (wait_result == WAIT_OBJECT_0) {
+                if (WaitForSingleObject(g_stop_event, 5000) == WAIT_OBJECT_0) {
                     break;
                 }
 
@@ -657,9 +632,7 @@ namespace {
                 &access_expires_at_unix,
                 &refresh_expires_at_unix
             )) {
-                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
-
-                if (wait_result == WAIT_OBJECT_0) {
+                if (WaitForSingleObject(g_stop_event, 5000) == WAIT_OBJECT_0) {
                     break;
                 }
 
@@ -669,12 +642,11 @@ namespace {
             const long long now_unix = static_cast<long long>(std::time(nullptr));
 
             if (refresh_expires_at_unix > 0 && now_unix >= refresh_expires_at_unix) {
+                witcher_av::ClearDatabase();
                 witcher::ClearLicenseTicket();
                 witcher::ClearAuthTokens();
 
-                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
-
-                if (wait_result == WAIT_OBJECT_0) {
+                if (WaitForSingleObject(g_stop_event, 5000) == WAIT_OBJECT_0) {
                     break;
                 }
 
@@ -692,7 +664,6 @@ namespace {
             }
 
             DWORD wait_milliseconds = static_cast<DWORD>(seconds_until_refresh * 1000);
-
             DWORD wait_result = WaitForSingleObject(g_stop_event, wait_milliseconds);
 
             if (wait_result == WAIT_OBJECT_0) {
@@ -707,6 +678,7 @@ namespace {
             std::wstring current_username = witcher::GetAuthenticatedUsername();
 
             if (current_refresh_token.empty()) {
+                witcher_av::ClearDatabase();
                 witcher::ClearLicenseTicket();
                 witcher::ClearAuthTokens();
                 continue;
@@ -716,9 +688,7 @@ namespace {
                 witcher::RefreshTokenRequest(current_refresh_token);
 
             if (!refresh_result.success) {
-                DWORD retry_wait_result = WaitForSingleObject(g_stop_event, 30000);
-
-                if (retry_wait_result == WAIT_OBJECT_0) {
+                if (WaitForSingleObject(g_stop_event, 30000) == WAIT_OBJECT_0) {
                     break;
                 }
 
@@ -753,9 +723,7 @@ namespace {
     DWORD WINAPI LicenseRefreshThread(void*) {
         while (true) {
             if (!witcher::IsAuthenticated() || !witcher::HasLicenseTicket()) {
-                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
-
-                if (wait_result == WAIT_OBJECT_0) {
+                if (WaitForSingleObject(g_stop_event, 5000) == WAIT_OBJECT_0) {
                     break;
                 }
 
@@ -775,11 +743,10 @@ namespace {
                 &mac_address,
                 &product_id
             )) {
+                witcher_av::ClearDatabase();
                 witcher::ClearLicenseTicket();
 
-                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
-
-                if (wait_result == WAIT_OBJECT_0) {
+                if (WaitForSingleObject(g_stop_event, 5000) == WAIT_OBJECT_0) {
                     break;
                 }
 
@@ -801,7 +768,6 @@ namespace {
             }
 
             DWORD wait_milliseconds = static_cast<DWORD>(seconds_until_refresh * 1000);
-
             DWORD wait_result = WaitForSingleObject(g_stop_event, wait_milliseconds);
 
             if (wait_result == WAIT_OBJECT_0) {
@@ -809,6 +775,7 @@ namespace {
             }
 
             if (!witcher::IsAuthenticated()) {
+                witcher_av::ClearDatabase();
                 witcher::ClearLicenseTicket();
                 continue;
             }
@@ -816,6 +783,7 @@ namespace {
             std::string access_token = witcher::GetAccessToken();
 
             if (access_token.empty()) {
+                witcher_av::ClearDatabase();
                 witcher::ClearLicenseTicket();
                 continue;
             }
@@ -829,9 +797,7 @@ namespace {
                 );
 
             if (!license_result.success) {
-                DWORD retry_wait_result = WaitForSingleObject(g_stop_event, 30000);
-
-                if (retry_wait_result == WAIT_OBJECT_0) {
+                if (WaitForSingleObject(g_stop_event, 30000) == WAIT_OBJECT_0) {
                     break;
                 }
 
@@ -844,6 +810,8 @@ namespace {
                 mac_address,
                 product_id
             );
+
+            witcher_av::LoadDefaultDatabase();
         }
 
         return 0;
@@ -928,11 +896,13 @@ namespace {
         InitializeCriticalSection(&g_process_lock);
         witcher::InitAuthState();
         witcher::InitLicenseState();
+        witcher_av::InitializeAvEngine();
 
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
         if (!g_stop_event) {
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
+            witcher_av::FreeAvEngine();
             witcher::FreeLicenseState();
             witcher::FreeAuthState();
             DeleteCriticalSection(&g_process_lock);
@@ -945,6 +915,7 @@ namespace {
             CloseHandle(g_stop_event);
             g_stop_event = nullptr;
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
+            witcher_av::FreeAvEngine();
             witcher::FreeLicenseState();
             witcher::FreeAuthState();
             DeleteCriticalSection(&g_process_lock);
@@ -971,6 +942,7 @@ namespace {
 
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
 
+            witcher_av::FreeAvEngine();
             witcher::FreeLicenseState();
             witcher::FreeAuthState();
             DeleteCriticalSection(&g_process_lock);
@@ -1005,6 +977,7 @@ namespace {
 
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
 
+            witcher_av::FreeAvEngine();
             witcher::FreeLicenseState();
             witcher::FreeAuthState();
             DeleteCriticalSection(&g_process_lock);
@@ -1042,6 +1015,7 @@ namespace {
         CloseHandle(g_stop_event);
         g_stop_event = nullptr;
 
+        witcher_av::FreeAvEngine();
         witcher::FreeLicenseState();
         witcher::FreeAuthState();
         DeleteCriticalSection(&g_process_lock);
@@ -1121,7 +1095,7 @@ namespace {
         return result;
     }
 
-} // namespace
+}
 
 extern "C" void RpcStopService(void) {
     if (!g_stop_event) {
@@ -1144,6 +1118,7 @@ extern "C" long RpcLogin(const wchar_t* username, const wchar_t* password) {
         witcher::LoginRequest(username, password);
 
     if (!login_result.success) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         witcher::ClearAuthTokens();
         return login_result.errorCode;
@@ -1174,6 +1149,7 @@ extern "C" long RpcLogin(const wchar_t* username, const wchar_t* password) {
 }
 
 extern "C" long RpcLogout(void) {
+    witcher_av::ClearDatabase();
     witcher::ClearLicenseTicket();
     witcher::ClearAuthTokens();
     return ERROR_SUCCESS;
@@ -1216,6 +1192,7 @@ extern "C" long RpcCheckLicense(
     }
 
     if (!witcher::IsAuthenticated()) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return ERROR_NOT_LOGGED_ON;
     }
@@ -1223,6 +1200,7 @@ extern "C" long RpcCheckLicense(
     std::string access_token = witcher::GetAccessToken();
 
     if (access_token.empty()) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return ERROR_NOT_LOGGED_ON;
     }
@@ -1240,6 +1218,7 @@ extern "C" long RpcCheckLicense(
         );
 
     if (!license_result.success) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return license_result.errorCode;
     }
@@ -1250,6 +1229,8 @@ extern "C" long RpcCheckLicense(
         mac_address_utf8,
         product_id_utf8
     );
+
+    witcher_av::LoadDefaultDatabase();
 
     return ERROR_SUCCESS;
 }
@@ -1264,6 +1245,7 @@ extern "C" long RpcActivateLicense(
     }
 
     if (!witcher::IsAuthenticated()) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return ERROR_NOT_LOGGED_ON;
     }
@@ -1271,6 +1253,7 @@ extern "C" long RpcActivateLicense(
     std::string access_token = witcher::GetAccessToken();
 
     if (access_token.empty()) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return ERROR_NOT_LOGGED_ON;
     }
@@ -1288,6 +1271,7 @@ extern "C" long RpcActivateLicense(
         );
 
     if (!activate_result.success) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return activate_result.errorCode;
     }
@@ -1299,6 +1283,8 @@ extern "C" long RpcActivateLicense(
             mac_address_utf8,
             product_id_utf8
         );
+
+        witcher_av::LoadDefaultDatabase();
 
         return ERROR_SUCCESS;
     }
@@ -1312,6 +1298,7 @@ extern "C" long RpcActivateLicense(
         );
 
     if (!check_result.success) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return check_result.errorCode;
     }
@@ -1322,6 +1309,8 @@ extern "C" long RpcActivateLicense(
         mac_address_utf8,
         product_id_utf8
     );
+
+    witcher_av::LoadDefaultDatabase();
 
     return ERROR_SUCCESS;
 }
@@ -1361,6 +1350,7 @@ extern "C" long RpcGetLicenseInfo(
 
 extern "C" long RpcRefreshLicenseStatus(void) {
     if (!witcher::IsAuthenticated()) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return ERROR_NOT_LOGGED_ON;
     }
@@ -1368,6 +1358,7 @@ extern "C" long RpcRefreshLicenseStatus(void) {
     std::string access_token = witcher::GetAccessToken();
 
     if (access_token.empty()) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return ERROR_NOT_LOGGED_ON;
     }
@@ -1385,6 +1376,7 @@ extern "C" long RpcRefreshLicenseStatus(void) {
         &mac_address,
         &product_id
     )) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return witcher::kErrorNoLicense;
     }
@@ -1398,6 +1390,7 @@ extern "C" long RpcRefreshLicenseStatus(void) {
         );
 
     if (!license_result.success) {
+        witcher_av::ClearDatabase();
         witcher::ClearLicenseTicket();
         return license_result.errorCode;
     }
@@ -1408,6 +1401,8 @@ extern "C" long RpcRefreshLicenseStatus(void) {
         mac_address,
         product_id
     );
+
+    witcher_av::LoadDefaultDatabase();
 
     return ERROR_SUCCESS;
 }
@@ -1424,6 +1419,134 @@ extern "C" long RpcGetAntivirusStatus(long* isEnabled) {
     }
 
     *isEnabled = 1;
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcGetAvDatabaseInfo(
+    long* isLoaded,
+    wchar_t* releaseDateBuffer,
+    unsigned long releaseDateCapacity,
+    unsigned long long* recordCount
+) {
+    if (!isLoaded || !releaseDateBuffer || releaseDateCapacity == 0 || !recordCount) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    *isLoaded = 0;
+    *recordCount = 0;
+    releaseDateBuffer[0] = L'\0';
+
+    if (!witcher::HasLicenseTicket()) {
+        return witcher::kErrorNoLicense;
+    }
+
+    witcher_av::AvDatabaseInfo info = witcher_av::GetDatabaseInfo();
+
+    *isLoaded = info.loaded ? 1 : 0;
+    *recordCount = info.recordCount;
+
+    if (!CopyStringToRpcBuffer(
+        info.releaseDate,
+        releaseDateBuffer,
+        releaseDateCapacity
+    )) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcScanFile(
+    const wchar_t* filePath,
+    long* isMalicious,
+    wchar_t* threatNameBuffer,
+    unsigned long threatNameCapacity,
+    unsigned long long* scannedFiles,
+    unsigned long long* maliciousFiles
+) {
+    if (!filePath || !isMalicious || !threatNameBuffer ||
+        threatNameCapacity == 0 || !scannedFiles || !maliciousFiles) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    *isMalicious = 0;
+    *scannedFiles = 0;
+    *maliciousFiles = 0;
+    threatNameBuffer[0] = L'\0';
+
+    if (!witcher::HasLicenseTicket()) {
+        return witcher::kErrorNoLicense;
+    }
+
+    if (!witcher_av::IsDatabaseLoaded()) {
+        witcher_av::LoadDefaultDatabase();
+    }
+
+    witcher_av::ScanResult result{};
+
+    if (!witcher_av::ScanFile(filePath, &result)) {
+        return ERROR_FILE_NOT_FOUND;
+    }
+
+    *isMalicious = result.malicious ? 1 : 0;
+    *scannedFiles = result.scannedFiles;
+    *maliciousFiles = result.maliciousFiles;
+
+    if (!CopyStringToRpcBuffer(
+        result.threatName,
+        threatNameBuffer,
+        threatNameCapacity
+    )) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcScanDirectory(
+    const wchar_t* directoryPath,
+    long* isMalicious,
+    wchar_t* threatNameBuffer,
+    unsigned long threatNameCapacity,
+    unsigned long long* scannedFiles,
+    unsigned long long* maliciousFiles
+) {
+    if (!directoryPath || !isMalicious || !threatNameBuffer ||
+        threatNameCapacity == 0 || !scannedFiles || !maliciousFiles) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    *isMalicious = 0;
+    *scannedFiles = 0;
+    *maliciousFiles = 0;
+    threatNameBuffer[0] = L'\0';
+
+    if (!witcher::HasLicenseTicket()) {
+        return witcher::kErrorNoLicense;
+    }
+
+    if (!witcher_av::IsDatabaseLoaded()) {
+        witcher_av::LoadDefaultDatabase();
+    }
+
+    witcher_av::ScanResult result{};
+
+    if (!witcher_av::ScanDirectory(directoryPath, &result)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+
+    *isMalicious = result.malicious ? 1 : 0;
+    *scannedFiles = result.scannedFiles;
+    *maliciousFiles = result.maliciousFiles;
+
+    if (!CopyStringToRpcBuffer(
+        result.threatName,
+        threatNameBuffer,
+        threatNameCapacity
+    )) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
     return ERROR_SUCCESS;
 }
 

@@ -46,4 +46,29 @@ interface WitcherControl
     long RpcGetAntivirusStatus(
         [out] long* isEnabled
     );
+
+    long RpcGetAvDatabaseInfo(
+        [out] long* isLoaded,
+        [out, size_is(releaseDateCapacity)] wchar_t* releaseDateBuffer,
+        [in] unsigned long releaseDateCapacity,
+        [out] unsigned long long* recordCount
+    );
+
+    long RpcScanFile(
+        [in, string] const wchar_t* filePath,
+        [out] long* isMalicious,
+        [out, size_is(threatNameCapacity)] wchar_t* threatNameBuffer,
+        [in] unsigned long threatNameCapacity,
+        [out] unsigned long long* scannedFiles,
+        [out] unsigned long long* maliciousFiles
+    );
+
+    long RpcScanDirectory(
+        [in, string] const wchar_t* directoryPath,
+        [out] long* isMalicious,
+        [out, size_is(threatNameCapacity)] wchar_t* threatNameBuffer,
+        [in] unsigned long threatNameCapacity,
+        [out] unsigned long long* scannedFiles,
+        [out] unsigned long long* maliciousFiles
+    );
 }
