@@ -41,6 +41,8 @@ interface WitcherControl
         [in] unsigned long expirationDateCapacity
     );
 
+    long RpcRefreshLicenseStatus(void);
+
     long RpcGetAntivirusStatus(
         [out] long* isEnabled
     );

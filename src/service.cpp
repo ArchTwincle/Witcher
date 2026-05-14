@@ -34,7 +34,11 @@ namespace {
     CRITICAL_SECTION g_process_lock;
     std::vector<PROCESS_INFORMATION> g_children;
 
-    void SetServiceStatusValue(DWORD state, DWORD win32_exit_code = NO_ERROR, DWORD wait_hint = 0) {
+    void SetServiceStatusValue(
+        DWORD state,
+        DWORD win32_exit_code = NO_ERROR,
+        DWORD wait_hint = 0
+    ) {
         g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
         g_status.dwCurrentState = state;
 
@@ -90,54 +94,101 @@ namespace {
             return false;
         }
 
-        constexpr wchar_t kProcessSecurityDescriptor[] =
-            L"D:P"
-            L"(A;;GA;;;SY)"
-            L"(A;;0x00121000;;;BA)"
-            L"(A;;0x00121000;;;BU)"
-            L"(A;;0x00121000;;;AU)";
+        /*
+            Best-effort protection against process termination.
 
-        PSECURITY_DESCRIPTOR security_descriptor = nullptr;
+            SYSTEM keeps full access because the service runs as LocalSystem
+            and must be able to manage itself and child processes.
 
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            kProcessSecurityDescriptor,
-            SDDL_REVISION_1,
-            &security_descriptor,
-            nullptr
-        )) {
+            Administrators, Users and Authenticated Users get explicit DENY
+            for PROCESS_TERMINATE and only limited read/sync rights.
+
+            Full protection against an elevated administrator is impossible
+            in ordinary user-mode code. An elevated administrator can use
+            SeDebugPrivilege, take ownership, rewrite DACLs, or use kernel-level
+            tools. True administrator-resistant protection requires a driver or
+            Windows Protected Process / Protected Process Light.
+        */
+
+        constexpr DWORD kLimitedProcessReadRights =
+            PROCESS_QUERY_LIMITED_INFORMATION |
+            SYNCHRONIZE;
+
+        EXPLICIT_ACCESSW entries[7]{};
+
+        entries[0].grfAccessPermissions = PROCESS_TERMINATE;
+        entries[0].grfAccessMode = DENY_ACCESS;
+        entries[0].grfInheritance = NO_INHERITANCE;
+        entries[0].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entries[0].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+        entries[0].Trustee.ptstrName = const_cast<LPWSTR>(L"BUILTIN\\Administrators");
+
+        entries[1].grfAccessPermissions = PROCESS_TERMINATE;
+        entries[1].grfAccessMode = DENY_ACCESS;
+        entries[1].grfInheritance = NO_INHERITANCE;
+        entries[1].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entries[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+        entries[1].Trustee.ptstrName = const_cast<LPWSTR>(L"BUILTIN\\Users");
+
+        entries[2].grfAccessPermissions = PROCESS_TERMINATE;
+        entries[2].grfAccessMode = DENY_ACCESS;
+        entries[2].grfInheritance = NO_INHERITANCE;
+        entries[2].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entries[2].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+        entries[2].Trustee.ptstrName = const_cast<LPWSTR>(L"NT AUTHORITY\\Authenticated Users");
+
+        entries[3].grfAccessPermissions = PROCESS_ALL_ACCESS;
+        entries[3].grfAccessMode = SET_ACCESS;
+        entries[3].grfInheritance = NO_INHERITANCE;
+        entries[3].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entries[3].Trustee.TrusteeType = TRUSTEE_IS_USER;
+        entries[3].Trustee.ptstrName = const_cast<LPWSTR>(L"NT AUTHORITY\\SYSTEM");
+
+        entries[4].grfAccessPermissions = kLimitedProcessReadRights;
+        entries[4].grfAccessMode = SET_ACCESS;
+        entries[4].grfInheritance = NO_INHERITANCE;
+        entries[4].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entries[4].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+        entries[4].Trustee.ptstrName = const_cast<LPWSTR>(L"BUILTIN\\Administrators");
+
+        entries[5].grfAccessPermissions = kLimitedProcessReadRights;
+        entries[5].grfAccessMode = SET_ACCESS;
+        entries[5].grfInheritance = NO_INHERITANCE;
+        entries[5].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entries[5].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+        entries[5].Trustee.ptstrName = const_cast<LPWSTR>(L"BUILTIN\\Users");
+
+        entries[6].grfAccessPermissions = kLimitedProcessReadRights;
+        entries[6].grfAccessMode = SET_ACCESS;
+        entries[6].grfInheritance = NO_INHERITANCE;
+        entries[6].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
+        entries[6].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+        entries[6].Trustee.ptstrName = const_cast<LPWSTR>(L"NT AUTHORITY\\Authenticated Users");
+
+        PACL new_dacl = nullptr;
+
+        DWORD result = SetEntriesInAclW(
+            static_cast<ULONG>(_countof(entries)),
+            entries,
+            nullptr,
+            &new_dacl
+        );
+
+        if (result != ERROR_SUCCESS || !new_dacl) {
             return false;
         }
 
-        PACL dacl = nullptr;
-        BOOL dacl_present = FALSE;
-        BOOL dacl_defaulted = FALSE;
-
-        if (!GetSecurityDescriptorDacl(
-            security_descriptor,
-            &dacl_present,
-            &dacl,
-            &dacl_defaulted
-        )) {
-            LocalFree(security_descriptor);
-            return false;
-        }
-
-        if (!dacl_present || !dacl) {
-            LocalFree(security_descriptor);
-            return false;
-        }
-
-        DWORD result = SetSecurityInfo(
+        result = SetSecurityInfo(
             process_handle,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             nullptr,
             nullptr,
-            dacl,
+            new_dacl,
             nullptr
         );
 
-        LocalFree(security_descriptor);
+        LocalFree(new_dacl);
 
         return result == ERROR_SUCCESS;
     }
@@ -503,15 +554,14 @@ namespace {
         const auto module_directory = GetModuleDirectory();
         const auto app_path = module_directory / witcher::kTrayAppExeName;
 
-        std::wstring command_line = L"\"" + app_path.wstring() + L"\" --hidden --service-child";
+        std::wstring command_line =
+            L"\"" + app_path.wstring() + L"\" --hidden --service-child";
 
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
 
         PROCESS_INFORMATION process{};
-
-        const DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT;
 
         BOOL created = CreateProcessAsUserW(
             primary_token,
@@ -520,7 +570,7 @@ namespace {
             nullptr,
             nullptr,
             FALSE,
-            creation_flags,
+            CREATE_UNICODE_ENVIRONMENT,
             environment,
             module_directory.c_str(),
             &startup,
@@ -591,57 +641,61 @@ namespace {
     DWORD WINAPI TokenRefreshThread(void*) {
         while (true) {
             if (!witcher::IsAuthenticated()) {
-                DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-                if (waitResult == WAIT_OBJECT_0) {
+                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
+
+                if (wait_result == WAIT_OBJECT_0) {
                     break;
                 }
 
                 continue;
             }
 
-            long long accessExpiresAtUnix = 0;
-            long long refreshExpiresAtUnix = 0;
+            long long access_expires_at_unix = 0;
+            long long refresh_expires_at_unix = 0;
 
             if (!witcher::GetTokenExpirations(
-                &accessExpiresAtUnix,
-                &refreshExpiresAtUnix
+                &access_expires_at_unix,
+                &refresh_expires_at_unix
             )) {
-                DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-                if (waitResult == WAIT_OBJECT_0) {
+                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
+
+                if (wait_result == WAIT_OBJECT_0) {
                     break;
                 }
 
                 continue;
             }
 
-            const long long nowUnix = static_cast<long long>(std::time(nullptr));
+            const long long now_unix = static_cast<long long>(std::time(nullptr));
 
-            if (refreshExpiresAtUnix > 0 && nowUnix >= refreshExpiresAtUnix) {
+            if (refresh_expires_at_unix > 0 && now_unix >= refresh_expires_at_unix) {
                 witcher::ClearLicenseTicket();
                 witcher::ClearAuthTokens();
 
-                DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-                if (waitResult == WAIT_OBJECT_0) {
+                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
+
+                if (wait_result == WAIT_OBJECT_0) {
                     break;
                 }
 
                 continue;
             }
 
-            long long secondsUntilRefresh = 60;
+            long long seconds_until_refresh = 60;
 
-            if (accessExpiresAtUnix > 0) {
-                secondsUntilRefresh = accessExpiresAtUnix - nowUnix - 60;
+            if (access_expires_at_unix > 0) {
+                seconds_until_refresh = access_expires_at_unix - now_unix - 60;
             }
 
-            if (secondsUntilRefresh < 5) {
-                secondsUntilRefresh = 5;
+            if (seconds_until_refresh < 5) {
+                seconds_until_refresh = 5;
             }
 
-            DWORD waitMilliseconds = static_cast<DWORD>(secondsUntilRefresh * 1000);
+            DWORD wait_milliseconds = static_cast<DWORD>(seconds_until_refresh * 1000);
 
-            DWORD waitResult = WaitForSingleObject(g_stop_event, waitMilliseconds);
-            if (waitResult == WAIT_OBJECT_0) {
+            DWORD wait_result = WaitForSingleObject(g_stop_event, wait_milliseconds);
+
+            if (wait_result == WAIT_OBJECT_0) {
                 break;
             }
 
@@ -649,46 +703,47 @@ namespace {
                 continue;
             }
 
-            std::string currentRefreshToken = witcher::GetRefreshToken();
-            std::wstring currentUsername = witcher::GetAuthenticatedUsername();
+            std::string current_refresh_token = witcher::GetRefreshToken();
+            std::wstring current_username = witcher::GetAuthenticatedUsername();
 
-            if (currentRefreshToken.empty()) {
+            if (current_refresh_token.empty()) {
                 witcher::ClearLicenseTicket();
                 witcher::ClearAuthTokens();
                 continue;
             }
 
-            witcher::RefreshResult refreshResult =
-                witcher::RefreshTokenRequest(currentRefreshToken);
+            witcher::RefreshResult refresh_result =
+                witcher::RefreshTokenRequest(current_refresh_token);
 
-            if (!refreshResult.success) {
-                DWORD retryWaitResult = WaitForSingleObject(g_stop_event, 30000);
-                if (retryWaitResult == WAIT_OBJECT_0) {
+            if (!refresh_result.success) {
+                DWORD retry_wait_result = WaitForSingleObject(g_stop_event, 30000);
+
+                if (retry_wait_result == WAIT_OBJECT_0) {
                     break;
                 }
 
                 continue;
             }
 
-            long long newAccessExpiresAtUnix = 0;
-            long long newRefreshExpiresAtUnix = 0;
+            long long new_access_expires_at_unix = 0;
+            long long new_refresh_expires_at_unix = 0;
 
             witcher::GetJwtExpirationUnix(
-                refreshResult.accessToken,
-                &newAccessExpiresAtUnix
+                refresh_result.accessToken,
+                &new_access_expires_at_unix
             );
 
             witcher::GetJwtExpirationUnix(
-                refreshResult.refreshToken,
-                &newRefreshExpiresAtUnix
+                refresh_result.refreshToken,
+                &new_refresh_expires_at_unix
             );
 
             witcher::SetAuthTokens(
-                currentUsername,
-                refreshResult.accessToken,
-                refreshResult.refreshToken,
-                newAccessExpiresAtUnix,
-                newRefreshExpiresAtUnix
+                current_username,
+                refresh_result.accessToken,
+                refresh_result.refreshToken,
+                new_access_expires_at_unix,
+                new_refresh_expires_at_unix
             );
         }
 
@@ -698,55 +753,58 @@ namespace {
     DWORD WINAPI LicenseRefreshThread(void*) {
         while (true) {
             if (!witcher::IsAuthenticated() || !witcher::HasLicenseTicket()) {
-                DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-                if (waitResult == WAIT_OBJECT_0) {
+                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
+
+                if (wait_result == WAIT_OBJECT_0) {
                     break;
                 }
 
                 continue;
             }
 
-            long long ticketSavedAtUnix = 0;
-            long long ticketLifetimeSeconds = 0;
-            std::string licenseCode;
-            std::string macAddress;
-            std::string productId;
+            long long ticket_saved_at_unix = 0;
+            long long ticket_lifetime_seconds = 0;
+            std::string license_code;
+            std::string mac_address;
+            std::string product_id;
 
             if (!witcher::GetLicenseRefreshRequestInfo(
-                &ticketSavedAtUnix,
-                &ticketLifetimeSeconds,
-                &licenseCode,
-                &macAddress,
-                &productId
+                &ticket_saved_at_unix,
+                &ticket_lifetime_seconds,
+                &license_code,
+                &mac_address,
+                &product_id
             )) {
                 witcher::ClearLicenseTicket();
 
-                DWORD waitResult = WaitForSingleObject(g_stop_event, 5000);
-                if (waitResult == WAIT_OBJECT_0) {
+                DWORD wait_result = WaitForSingleObject(g_stop_event, 5000);
+
+                if (wait_result == WAIT_OBJECT_0) {
                     break;
                 }
 
                 continue;
             }
 
-            long long secondsUntilRefresh = 60;
+            long long seconds_until_refresh = 60;
 
-            if (ticketLifetimeSeconds > 0) {
-                const long long nowUnix = static_cast<long long>(std::time(nullptr));
-                const long long refreshAtUnix =
-                    ticketSavedAtUnix + ticketLifetimeSeconds - 60;
+            if (ticket_lifetime_seconds > 0) {
+                const long long now_unix = static_cast<long long>(std::time(nullptr));
+                const long long refresh_at_unix =
+                    ticket_saved_at_unix + ticket_lifetime_seconds - 60;
 
-                secondsUntilRefresh = refreshAtUnix - nowUnix;
+                seconds_until_refresh = refresh_at_unix - now_unix;
             }
 
-            if (secondsUntilRefresh < 5) {
-                secondsUntilRefresh = 5;
+            if (seconds_until_refresh < 5) {
+                seconds_until_refresh = 5;
             }
 
-            DWORD waitMilliseconds = static_cast<DWORD>(secondsUntilRefresh * 1000);
+            DWORD wait_milliseconds = static_cast<DWORD>(seconds_until_refresh * 1000);
 
-            DWORD waitResult = WaitForSingleObject(g_stop_event, waitMilliseconds);
-            if (waitResult == WAIT_OBJECT_0) {
+            DWORD wait_result = WaitForSingleObject(g_stop_event, wait_milliseconds);
+
+            if (wait_result == WAIT_OBJECT_0) {
                 break;
             }
 
@@ -755,24 +813,25 @@ namespace {
                 continue;
             }
 
-            std::string accessToken = witcher::GetAccessToken();
+            std::string access_token = witcher::GetAccessToken();
 
-            if (accessToken.empty()) {
+            if (access_token.empty()) {
                 witcher::ClearLicenseTicket();
                 continue;
             }
 
-            witcher::LicenseCheckResult licenseResult =
+            witcher::LicenseCheckResult license_result =
                 witcher::CheckLicenseRequest(
-                    accessToken,
-                    licenseCode,
-                    macAddress,
-                    productId
+                    access_token,
+                    license_code,
+                    mac_address,
+                    product_id
                 );
 
-            if (!licenseResult.success) {
-                DWORD retryWaitResult = WaitForSingleObject(g_stop_event, 30000);
-                if (retryWaitResult == WAIT_OBJECT_0) {
+            if (!license_result.success) {
+                DWORD retry_wait_result = WaitForSingleObject(g_stop_event, 30000);
+
+                if (retry_wait_result == WAIT_OBJECT_0) {
                     break;
                 }
 
@@ -780,10 +839,10 @@ namespace {
             }
 
             StoreLicenseTicket(
-                licenseResult.licenseTicket,
-                licenseCode,
-                macAddress,
-                productId
+                license_result.licenseTicket,
+                license_code,
+                mac_address,
+                product_id
             );
         }
 
@@ -819,6 +878,7 @@ namespace {
         }
 
         status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, TRUE);
+
         if (status != RPC_S_OK) {
             SetEvent(g_stop_event);
         }
@@ -826,7 +886,12 @@ namespace {
         return status;
     }
 
-    DWORD WINAPI ServiceControlHandlerEx(DWORD control, DWORD event_type, void* event_data, void*) {
+    DWORD WINAPI ServiceControlHandlerEx(
+        DWORD control,
+        DWORD event_type,
+        void* event_data,
+        void*
+    ) {
         if (control == SERVICE_CONTROL_SESSIONCHANGE) {
             if (event_type == WTS_SESSION_LOGON ||
                 event_type == WTS_SESSION_UNLOCK ||
@@ -865,6 +930,7 @@ namespace {
         witcher::InitLicenseState();
 
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
         if (!g_stop_event) {
             SetServiceStatusValue(SERVICE_STOPPED, GetLastError());
             witcher::FreeLicenseState();
@@ -874,6 +940,7 @@ namespace {
         }
 
         HANDLE rpc_thread = CreateThread(nullptr, 0, RpcServerThread, nullptr, 0, nullptr);
+
         if (!rpc_thread) {
             CloseHandle(g_stop_event);
             g_stop_event = nullptr;
@@ -987,6 +1054,7 @@ namespace {
         GetModuleFileNameW(nullptr, module_path, MAX_PATH);
 
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+
         if (!scm) {
             return false;
         }
@@ -1008,12 +1076,17 @@ namespace {
         );
 
         if (!service && GetLastError() == ERROR_SERVICE_EXISTS) {
-            service = OpenServiceW(scm, witcher::kServiceName, SERVICE_CHANGE_CONFIG | SERVICE_START);
+            service = OpenServiceW(
+                scm,
+                witcher::kServiceName,
+                SERVICE_CHANGE_CONFIG | SERVICE_START
+            );
         }
 
         if (service) {
             SERVICE_DESCRIPTIONW description{};
-            description.lpDescription = const_cast<LPWSTR>(L"Starts and controls the Witcher tray application in user sessions.");
+            description.lpDescription =
+                const_cast<LPWSTR>(L"Starts and controls the Witcher tray application in user sessions.");
             ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description);
             CloseServiceHandle(service);
         }
@@ -1024,11 +1097,17 @@ namespace {
 
     bool UninstallService() {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+
         if (!scm) {
             return false;
         }
 
-        SC_HANDLE service = OpenServiceW(scm, witcher::kServiceName, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
+        SC_HANDLE service = OpenServiceW(
+            scm,
+            witcher::kServiceName,
+            DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS
+        );
+
         if (!service) {
             CloseServiceHandle(scm);
             return false;
@@ -1042,7 +1121,7 @@ namespace {
         return result;
     }
 
-}
+} // namespace
 
 extern "C" void RpcStopService(void) {
     if (!g_stop_event) {
@@ -1061,34 +1140,34 @@ extern "C" long RpcLogin(const wchar_t* username, const wchar_t* password) {
         return ERROR_INVALID_PARAMETER;
     }
 
-    witcher::LoginResult loginResult =
+    witcher::LoginResult login_result =
         witcher::LoginRequest(username, password);
 
-    if (!loginResult.success) {
+    if (!login_result.success) {
         witcher::ClearLicenseTicket();
         witcher::ClearAuthTokens();
-        return loginResult.errorCode;
+        return login_result.errorCode;
     }
 
-    long long accessExpiresAtUnix = 0;
-    long long refreshExpiresAtUnix = 0;
+    long long access_expires_at_unix = 0;
+    long long refresh_expires_at_unix = 0;
 
     witcher::GetJwtExpirationUnix(
-        loginResult.accessToken,
-        &accessExpiresAtUnix
+        login_result.accessToken,
+        &access_expires_at_unix
     );
 
     witcher::GetJwtExpirationUnix(
-        loginResult.refreshToken,
-        &refreshExpiresAtUnix
+        login_result.refreshToken,
+        &refresh_expires_at_unix
     );
 
     witcher::SetAuthTokens(
-        loginResult.username,
-        loginResult.accessToken,
-        loginResult.refreshToken,
-        accessExpiresAtUnix,
-        refreshExpiresAtUnix
+        login_result.username,
+        login_result.accessToken,
+        login_result.refreshToken,
+        access_expires_at_unix,
+        refresh_expires_at_unix
     );
 
     return ERROR_SUCCESS;
@@ -1141,35 +1220,35 @@ extern "C" long RpcCheckLicense(
         return ERROR_NOT_LOGGED_ON;
     }
 
-    std::string accessToken = witcher::GetAccessToken();
+    std::string access_token = witcher::GetAccessToken();
 
-    if (accessToken.empty()) {
+    if (access_token.empty()) {
         witcher::ClearLicenseTicket();
         return ERROR_NOT_LOGGED_ON;
     }
 
-    const std::string licenseCodeUtf8 = WideToUtf8(licenseCode);
-    const std::string macAddressUtf8 = WideToUtf8(macAddress);
-    const std::string productIdUtf8 = WideToUtf8(productId);
+    const std::string license_code_utf8 = WideToUtf8(licenseCode);
+    const std::string mac_address_utf8 = WideToUtf8(macAddress);
+    const std::string product_id_utf8 = WideToUtf8(productId);
 
-    witcher::LicenseCheckResult licenseResult =
+    witcher::LicenseCheckResult license_result =
         witcher::CheckLicenseRequest(
-            accessToken,
-            licenseCodeUtf8,
-            macAddressUtf8,
-            productIdUtf8
+            access_token,
+            license_code_utf8,
+            mac_address_utf8,
+            product_id_utf8
         );
 
-    if (!licenseResult.success) {
+    if (!license_result.success) {
         witcher::ClearLicenseTicket();
-        return licenseResult.errorCode;
+        return license_result.errorCode;
     }
 
     StoreLicenseTicket(
-        licenseResult.licenseTicket,
-        licenseCodeUtf8,
-        macAddressUtf8,
-        productIdUtf8
+        license_result.licenseTicket,
+        license_code_utf8,
+        mac_address_utf8,
+        product_id_utf8
     );
 
     return ERROR_SUCCESS;
@@ -1189,59 +1268,59 @@ extern "C" long RpcActivateLicense(
         return ERROR_NOT_LOGGED_ON;
     }
 
-    std::string accessToken = witcher::GetAccessToken();
+    std::string access_token = witcher::GetAccessToken();
 
-    if (accessToken.empty()) {
+    if (access_token.empty()) {
         witcher::ClearLicenseTicket();
         return ERROR_NOT_LOGGED_ON;
     }
 
-    const std::string licenseCodeUtf8 = WideToUtf8(licenseCode);
-    const std::string macAddressUtf8 = WideToUtf8(macAddress);
-    const std::string productIdUtf8 = WideToUtf8(productId);
+    const std::string license_code_utf8 = WideToUtf8(licenseCode);
+    const std::string mac_address_utf8 = WideToUtf8(macAddress);
+    const std::string product_id_utf8 = WideToUtf8(productId);
 
-    witcher::LicenseActivateResult activateResult =
+    witcher::LicenseActivateResult activate_result =
         witcher::ActivateLicenseRequest(
-            accessToken,
-            licenseCodeUtf8,
-            macAddressUtf8,
-            productIdUtf8
+            access_token,
+            license_code_utf8,
+            mac_address_utf8,
+            product_id_utf8
         );
 
-    if (!activateResult.success) {
+    if (!activate_result.success) {
         witcher::ClearLicenseTicket();
-        return activateResult.errorCode;
+        return activate_result.errorCode;
     }
 
-    if (!activateResult.licenseTicket.empty()) {
+    if (!activate_result.licenseTicket.empty()) {
         StoreLicenseTicket(
-            activateResult.licenseTicket,
-            licenseCodeUtf8,
-            macAddressUtf8,
-            productIdUtf8
+            activate_result.licenseTicket,
+            license_code_utf8,
+            mac_address_utf8,
+            product_id_utf8
         );
 
         return ERROR_SUCCESS;
     }
 
-    witcher::LicenseCheckResult checkResult =
+    witcher::LicenseCheckResult check_result =
         witcher::CheckLicenseRequest(
-            accessToken,
-            licenseCodeUtf8,
-            macAddressUtf8,
-            productIdUtf8
+            access_token,
+            license_code_utf8,
+            mac_address_utf8,
+            product_id_utf8
         );
 
-    if (!checkResult.success) {
+    if (!check_result.success) {
         witcher::ClearLicenseTicket();
-        return checkResult.errorCode;
+        return check_result.errorCode;
     }
 
     StoreLicenseTicket(
-        checkResult.licenseTicket,
-        licenseCodeUtf8,
-        macAddressUtf8,
-        productIdUtf8
+        check_result.licenseTicket,
+        license_code_utf8,
+        mac_address_utf8,
+        product_id_utf8
     );
 
     return ERROR_SUCCESS;
@@ -1259,23 +1338,76 @@ extern "C" long RpcGetLicenseInfo(
     *hasLicense = 0;
     expirationDateBuffer[0] = L'\0';
 
-    std::string expirationDateUtf8;
+    std::string expiration_date_utf8;
 
-    if (!witcher::GetLicensePublicInfo(&expirationDateUtf8)) {
+    if (!witcher::GetLicensePublicInfo(&expiration_date_utf8)) {
         return ERROR_SUCCESS;
     }
 
     *hasLicense = 1;
 
-    std::wstring expirationDate = Utf8ToWide(expirationDateUtf8);
+    std::wstring expiration_date = Utf8ToWide(expiration_date_utf8);
 
     if (!CopyStringToRpcBuffer(
-        expirationDate,
+        expiration_date,
         expirationDateBuffer,
         expirationDateCapacity
     )) {
         return ERROR_INVALID_PARAMETER;
     }
+
+    return ERROR_SUCCESS;
+}
+
+extern "C" long RpcRefreshLicenseStatus(void) {
+    if (!witcher::IsAuthenticated()) {
+        witcher::ClearLicenseTicket();
+        return ERROR_NOT_LOGGED_ON;
+    }
+
+    std::string access_token = witcher::GetAccessToken();
+
+    if (access_token.empty()) {
+        witcher::ClearLicenseTicket();
+        return ERROR_NOT_LOGGED_ON;
+    }
+
+    long long ticket_saved_at_unix = 0;
+    long long ticket_lifetime_seconds = 0;
+    std::string license_code;
+    std::string mac_address;
+    std::string product_id;
+
+    if (!witcher::GetLicenseRefreshRequestInfo(
+        &ticket_saved_at_unix,
+        &ticket_lifetime_seconds,
+        &license_code,
+        &mac_address,
+        &product_id
+    )) {
+        witcher::ClearLicenseTicket();
+        return witcher::kErrorNoLicense;
+    }
+
+    witcher::LicenseCheckResult license_result =
+        witcher::CheckLicenseRequest(
+            access_token,
+            license_code,
+            mac_address,
+            product_id
+        );
+
+    if (!license_result.success) {
+        witcher::ClearLicenseTicket();
+        return license_result.errorCode;
+    }
+
+    StoreLicenseTicket(
+        license_result.licenseTicket,
+        license_code,
+        mac_address,
+        product_id
+    );
 
     return ERROR_SUCCESS;
 }
@@ -1317,8 +1449,8 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     SERVICE_TABLE_ENTRYW service_table[] = {
-        {const_cast<LPWSTR>(witcher::kServiceName), ServiceMain},
-        {nullptr, nullptr}
+        { const_cast<LPWSTR>(witcher::kServiceName), ServiceMain },
+        { nullptr, nullptr }
     };
 
     return StartServiceCtrlDispatcherW(service_table) ? 0 : 1;

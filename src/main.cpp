@@ -68,7 +68,7 @@ namespace {
     std::wstring ToLower(std::wstring text) {
         std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
             return static_cast<wchar_t>(towlower(ch));
-        });
+            });
 
         return text;
     }
@@ -549,6 +549,25 @@ namespace {
         return true;
     }
 
+    bool RpcRefreshLicenseStatusSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcRefreshLicenseStatus();
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"License refresh failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_last_error_text.clear();
+        return true;
+    }
+
     bool RpcLoginSafe(
         const std::wstring& username,
         const std::wstring& password
@@ -772,6 +791,10 @@ namespace {
         bool old_has_license = g_has_license;
 
         g_last_error_text.clear();
+
+        if (g_is_authenticated && g_has_license) {
+            RpcRefreshLicenseStatusSafe();
+        }
 
         RefreshApplicationState();
 
@@ -1053,6 +1076,11 @@ namespace {
 
             case kControlRefreshButton:
                 g_last_error_text.clear();
+
+                if (g_is_authenticated && g_has_license) {
+                    RpcRefreshLicenseStatusSafe();
+                }
+
                 RefreshApplicationState();
                 return 0;
 
