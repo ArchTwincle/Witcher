@@ -44,6 +44,7 @@ add_executable(WitcherTrayService
     src/http_client.cpp
     src/jwt_utils.cpp
     src/license_state.cpp
+    src/av_engine.cpp
     ${RPC_SERVER}
 )
 
@@ -76,6 +77,8 @@ target_link_libraries(TrayWin32App PRIVATE
     advapi32
     rpcrt4
     shell32
+    comdlg32
+    ole32
 )
 
 target_link_libraries(WitcherTrayService PRIVATE
