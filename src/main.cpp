@@ -2,6 +2,7 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <rpc.h>
+#include <sddl.h>
 
 #include <algorithm>
 #include <string>
@@ -95,61 +96,116 @@ namespace {
     }
 
     int RunSecureStopConfirmation() {
+        /*
+            Secure-stop confirmation helper.
+
+            This helper is started by the service in the active user's session:
+                TrayWin32App.exe --secure-stop-confirm
+
+            It creates a separate restricted private desktop, switches the user
+            to that desktop, shows a blocking confirmation dialog, then switches
+            back to the original input desktop.
+
+            This is not the system Winlogon/UAC secure desktop, because ordinary
+            user-mode applications cannot display UI on the real Winlogon desktop.
+            For this assignment this is the closest practical implementation:
+            a separate private desktop with a restricted DACL.
+        */
+
         HDESK original_desktop = OpenInputDesktop(
             0,
             FALSE,
-            DESKTOP_SWITCHDESKTOP | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS
+            DESKTOP_SWITCHDESKTOP |
+            DESKTOP_READOBJECTS |
+            DESKTOP_WRITEOBJECTS |
+            DESKTOP_CREATEWINDOW
         );
 
-        HDESK confirm_desktop = CreateDesktopW(
-            L"WitcherStopConfirmationDesktop",
+        if (!original_desktop) {
+            return 1;
+        }
+
+        wchar_t desktop_name[128]{};
+
+        wsprintfW(
+            desktop_name,
+            L"WitcherStopConfirmationDesktop-%lu",
+            GetCurrentProcessId()
+        );
+
+        PSECURITY_DESCRIPTOR security_descriptor = nullptr;
+
+        /*
+            Desktop DACL:
+            - SY = LocalSystem full access
+            - OW = object owner full access
+
+            The helper process is launched with the active user's token, so the
+            object owner is the active user.
+        */
+        constexpr wchar_t kDesktopSecurityDescriptor[] =
+            L"D:P"
+            L"(A;;GA;;;SY)"
+            L"(A;;GA;;;OW)";
+
+        SECURITY_ATTRIBUTES security_attributes{};
+        security_attributes.nLength = sizeof(security_attributes);
+        security_attributes.bInheritHandle = FALSE;
+        security_attributes.lpSecurityDescriptor = nullptr;
+
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            kDesktopSecurityDescriptor,
+            SDDL_REVISION_1,
+            &security_descriptor,
+            nullptr
+        )) {
+            security_attributes.lpSecurityDescriptor = security_descriptor;
+        }
+
+        HDESK confirmation_desktop = CreateDesktopW(
+            desktop_name,
             nullptr,
             nullptr,
             0,
             GENERIC_ALL,
-            nullptr
+            security_attributes.lpSecurityDescriptor ? &security_attributes : nullptr
         );
 
-        if (!confirm_desktop) {
-            int fallback_result = MessageBoxW(
-                nullptr,
-                L"Stop WitcherTrayService and close all tray applications?",
-                L"WitcherTrayService",
-                MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
-            );
-
-            if (original_desktop) {
-                CloseDesktop(original_desktop);
-            }
-
-            return fallback_result == IDYES ? 0 : 1;
+        if (security_descriptor) {
+            LocalFree(security_descriptor);
+            security_descriptor = nullptr;
         }
 
-        bool switched_to_confirm = SwitchDesktop(confirm_desktop) != FALSE;
-        bool thread_desktop_set = SetThreadDesktop(confirm_desktop) != FALSE;
+        if (!confirmation_desktop) {
+            CloseDesktop(original_desktop);
+            return 1;
+        }
+
+        const BOOL switched_to_confirmation = SwitchDesktop(confirmation_desktop);
+        const BOOL thread_desktop_set = SetThreadDesktop(confirmation_desktop);
 
         int result = IDNO;
 
-        if (switched_to_confirm && thread_desktop_set) {
+        if (switched_to_confirmation && thread_desktop_set) {
             result = MessageBoxW(
                 nullptr,
                 L"Stop WitcherTrayService and close all tray applications?",
                 L"WitcherTrayService",
-                MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
+                MB_YESNO |
+                MB_ICONWARNING |
+                MB_TOPMOST |
+                MB_SETFOREGROUND |
+                MB_SYSTEMMODAL
             );
         }
 
-        if (original_desktop) {
-            SwitchDesktop(original_desktop);
-        }
+        SwitchDesktop(original_desktop);
+        SetThreadDesktop(original_desktop);
 
-        CloseDesktop(confirm_desktop);
+        CloseDesktop(confirmation_desktop);
+        CloseDesktop(original_desktop);
 
-        if (original_desktop) {
-            CloseDesktop(original_desktop);
-        }
-
-        if (!switched_to_confirm || !thread_desktop_set) {
+        if (!switched_to_confirmation || !thread_desktop_set) {
             return 1;
         }
 
