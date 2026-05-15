@@ -88,6 +88,7 @@ target_link_libraries(WitcherTrayService PRIVATE
     userenv
     winhttp
     crypt32
+    wininet
 )
 
 if(MSVC)

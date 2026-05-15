@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <wincrypt.h>
+#include <wininet.h>
 
 #include <algorithm>
 #include <array>
@@ -12,8 +13,10 @@
 #include <mutex>
 #include <queue>
 #include <sstream>
+#include <cstring>
 
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wininet.lib")
 
 namespace witcher_av {
 
@@ -859,4 +862,271 @@ namespace witcher_av {
         return true;
     }
 
+}
+namespace witcher_av {
+
+    bool LoadDatabaseOnServiceStart() {
+        std::lock_guard<std::mutex> guard(g_database_lock);
+
+        constexpr unsigned long kMagic = 0x31424457; // WDB1
+        constexpr unsigned long kVersion = 1;
+        constexpr size_t kSigSize = 32;
+        constexpr char kSigKey[] = "WITCHER_AVDB_SIGN_KEY_V1";
+
+        struct Manifest {
+            unsigned long magic = 0;
+            unsigned long version = 0;
+            unsigned long recordCount = 0;
+            unsigned long long releaseDateUnix = 0;
+            unsigned char recordsDigest[32]{};
+            unsigned char manifestSig[32]{};
+        };
+
+        struct RecordHdr {
+            unsigned long rawSigLen = 0;
+            unsigned long long offsetBegin = 0;
+            unsigned long long offsetEnd = 0;
+            unsigned long long objectType = 0;
+            unsigned long threatNameLen = 0;
+            unsigned char recordSig[32]{};
+        };
+
+        auto moduleDir = []() {
+            wchar_t path[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, path, MAX_PATH);
+            return std::filesystem::path(path).parent_path();
+        };
+
+        const auto baseDir = moduleDir();
+        const auto manifestPath = baseDir / L"av_manifest.bin";
+        const auto recordsPath = baseDir / L"av_records.bin";
+        const auto backupManifestPath = baseDir / L"av_manifest.bak";
+        const auto backupRecordsPath = baseDir / L"av_records.bak";
+
+        auto sign = [&](const std::vector<unsigned char>& payload) {
+            std::vector<unsigned char> signedPayload;
+            signedPayload.insert(signedPayload.end(), kSigKey, kSigKey + sizeof(kSigKey) - 1);
+            signedPayload.insert(signedPayload.end(), payload.begin(), payload.end());
+            std::vector<unsigned char> digest;
+            ComputeSha256(signedPayload, &digest);
+            return digest;
+        };
+
+        auto writeCurrentToFiles = [&]() {
+            std::vector<unsigned char> recordsBlob;
+
+            for (const auto& record : g_flat_records) {
+                RecordHdr hdr{};
+                hdr.rawSigLen = static_cast<unsigned long>(record.rawSignature.size());
+                hdr.offsetBegin = record.offsetBegin;
+                hdr.offsetEnd = record.offsetEnd;
+                hdr.objectType = static_cast<unsigned long long>(record.objectType);
+                hdr.threatNameLen = static_cast<unsigned long>(record.threatName.size());
+
+                std::vector<unsigned char> body;
+                body.insert(body.end(), reinterpret_cast<unsigned char*>(&hdr.rawSigLen), reinterpret_cast<unsigned char*>(&hdr.rawSigLen) + sizeof(hdr.rawSigLen));
+                body.insert(body.end(), record.rawSignature.begin(), record.rawSignature.end());
+                body.insert(body.end(), reinterpret_cast<unsigned char*>(&hdr.offsetBegin), reinterpret_cast<unsigned char*>(&hdr.offsetBegin) + sizeof(hdr.offsetBegin));
+                body.insert(body.end(), reinterpret_cast<unsigned char*>(&hdr.offsetEnd), reinterpret_cast<unsigned char*>(&hdr.offsetEnd) + sizeof(hdr.offsetEnd));
+                body.insert(body.end(), reinterpret_cast<unsigned char*>(&hdr.objectType), reinterpret_cast<unsigned char*>(&hdr.objectType) + sizeof(hdr.objectType));
+                const auto* threatBytes = reinterpret_cast<const unsigned char*>(record.threatName.data());
+                body.insert(body.end(), threatBytes, threatBytes + record.threatName.size() * sizeof(wchar_t));
+
+                std::vector<unsigned char> recordSig = sign(body);
+                if (recordSig.size() == kSigSize) {
+                    memcpy(hdr.recordSig, recordSig.data(), kSigSize);
+                }
+
+                recordsBlob.insert(recordsBlob.end(), reinterpret_cast<unsigned char*>(&hdr), reinterpret_cast<unsigned char*>(&hdr) + sizeof(hdr));
+                recordsBlob.insert(recordsBlob.end(), record.rawSignature.begin(), record.rawSignature.end());
+                recordsBlob.insert(recordsBlob.end(), threatBytes, threatBytes + record.threatName.size() * sizeof(wchar_t));
+            }
+
+            std::vector<unsigned char> recordsDigest;
+            ComputeSha256(recordsBlob, &recordsDigest);
+
+            Manifest manifest{};
+            manifest.magic = kMagic;
+            manifest.version = kVersion;
+            manifest.recordCount = static_cast<unsigned long>(g_flat_records.size());
+            manifest.releaseDateUnix = static_cast<unsigned long long>(time(nullptr));
+            if (recordsDigest.size() == 32) {
+                memcpy(manifest.recordsDigest, recordsDigest.data(), 32);
+            }
+
+            std::vector<unsigned char> manifestPayload(
+                reinterpret_cast<unsigned char*>(&manifest),
+                reinterpret_cast<unsigned char*>(&manifest) + sizeof(Manifest) - 32
+            );
+            std::vector<unsigned char> manifestSig = sign(manifestPayload);
+            if (manifestSig.size() == kSigSize) {
+                memcpy(manifest.manifestSig, manifestSig.data(), kSigSize);
+            }
+
+            std::ofstream recOut(recordsPath, std::ios::binary | std::ios::trunc);
+            recOut.write(reinterpret_cast<const char*>(recordsBlob.data()), static_cast<std::streamsize>(recordsBlob.size()));
+            recOut.close();
+
+            std::ofstream manOut(manifestPath, std::ios::binary | std::ios::trunc);
+            manOut.write(reinterpret_cast<const char*>(&manifest), sizeof(manifest));
+            manOut.close();
+        };
+
+        auto loadFromFiles = [&](const std::filesystem::path& manPath, const std::filesystem::path& recPath, bool allowRecordSkip) {
+            std::ifstream manIn(manPath, std::ios::binary);
+            std::ifstream recIn(recPath, std::ios::binary);
+            if (!manIn.good() || !recIn.good()) {
+                return false;
+            }
+
+            Manifest manifest{};
+            manIn.read(reinterpret_cast<char*>(&manifest), sizeof(manifest));
+            if (!manIn.good() || manifest.magic != kMagic || manifest.version != kVersion) {
+                return false;
+            }
+
+            std::vector<unsigned char> manifestPayload(
+                reinterpret_cast<unsigned char*>(&manifest),
+                reinterpret_cast<unsigned char*>(&manifest) + sizeof(Manifest) - 32
+            );
+            std::vector<unsigned char> manifestSig = sign(manifestPayload);
+            if (manifestSig.size() != 32 || memcmp(manifestSig.data(), manifest.manifestSig, 32) != 0) {
+                return false;
+            }
+
+            std::vector<unsigned char> recordsBlob((std::istreambuf_iterator<char>(recIn)), std::istreambuf_iterator<char>());
+            std::vector<unsigned char> recordsDigest;
+            ComputeSha256(recordsBlob, &recordsDigest);
+            if (recordsDigest.size() != 32 || memcmp(recordsDigest.data(), manifest.recordsDigest, 32) != 0) {
+                return false;
+            }
+
+            g_database.clear();
+            g_flat_records.clear();
+            g_aho_nodes.clear();
+
+            size_t offset = 0;
+            while (offset + sizeof(RecordHdr) <= recordsBlob.size()) {
+                RecordHdr hdr{};
+                memcpy(&hdr, recordsBlob.data() + offset, sizeof(hdr));
+                offset += sizeof(hdr);
+
+                const size_t threatBytes = static_cast<size_t>(hdr.threatNameLen) * sizeof(wchar_t);
+                if (offset + hdr.rawSigLen + threatBytes > recordsBlob.size()) {
+                    break;
+                }
+
+                std::vector<unsigned char> rawSig(
+                    recordsBlob.begin() + static_cast<long long>(offset),
+                    recordsBlob.begin() + static_cast<long long>(offset + hdr.rawSigLen)
+                );
+                offset += hdr.rawSigLen;
+
+                const wchar_t* threatPtr = reinterpret_cast<const wchar_t*>(recordsBlob.data() + offset);
+                std::wstring threatName(threatPtr, threatPtr + hdr.threatNameLen);
+                offset += threatBytes;
+
+                std::vector<unsigned char> body;
+                body.insert(body.end(), reinterpret_cast<unsigned char*>(&hdr.rawSigLen), reinterpret_cast<unsigned char*>(&hdr.rawSigLen) + sizeof(hdr.rawSigLen));
+                body.insert(body.end(), rawSig.begin(), rawSig.end());
+                body.insert(body.end(), reinterpret_cast<unsigned char*>(&hdr.offsetBegin), reinterpret_cast<unsigned char*>(&hdr.offsetBegin) + sizeof(hdr.offsetBegin));
+                body.insert(body.end(), reinterpret_cast<unsigned char*>(&hdr.offsetEnd), reinterpret_cast<unsigned char*>(&hdr.offsetEnd) + sizeof(hdr.offsetEnd));
+                body.insert(body.end(), reinterpret_cast<unsigned char*>(&hdr.objectType), reinterpret_cast<unsigned char*>(&hdr.objectType) + sizeof(hdr.objectType));
+                const auto* tBytes = reinterpret_cast<const unsigned char*>(threatName.data());
+                body.insert(body.end(), tBytes, tBytes + threatName.size() * sizeof(wchar_t));
+
+                std::vector<unsigned char> expectedSig = sign(body);
+                if (expectedSig.size() != 32 || memcmp(expectedSig.data(), hdr.recordSig, 32) != 0) {
+                    if (allowRecordSkip) {
+                        continue;
+                    }
+                    return false;
+                }
+
+                AvRecord record{};
+                record.rawSignature = std::move(rawSig);
+                record.objectSignaturePrefix = ReadPrefixFromBytes(record.rawSignature, 0);
+                record.objectSignatureLength = static_cast<unsigned long>(record.rawSignature.size());
+                record.offsetBegin = hdr.offsetBegin;
+                record.offsetEnd = hdr.offsetEnd;
+                record.objectType = static_cast<AvObjectType>(hdr.objectType);
+                record.threatName = threatName;
+                ComputeSha256(record.rawSignature, &record.objectSignature);
+                ComputeRecordSignature(record, &record.avRecordSignature);
+                AddRecordUnlocked(record);
+            }
+
+            BuildAhoCorasickUnlocked();
+            g_database_loaded = !g_flat_records.empty();
+            g_release_date = L"disk-db";
+            return g_database_loaded;
+        };
+
+        auto loadDefaults = [&]() {
+            g_database.clear();
+            g_flat_records.clear();
+            g_aho_nodes.clear();
+
+            AddRecordUnlocked(MakeRecord("WITCHER_SCRIPT_TEST_MALWARE", 0, kDefaultOffsetEnd, AvObjectType::PowerShellScript, L"Witcher.Test.PowerShell"));
+            AddRecordUnlocked(MakeRecord("WITCHER_JS_TEST_MALWARE", 0, kDefaultOffsetEnd, AvObjectType::JavaScript, L"Witcher.Test.JavaScript"));
+            AddRecordUnlocked(MakeRecord("WITCHER_PE_TEST_MALWARE", 0, kDefaultOffsetEnd, AvObjectType::PeFile, L"Witcher.Test.PE"));
+            AddRecordUnlocked(MakeRecord("WITCHER_PY_TEST_MALWARE", 0, kDefaultOffsetEnd, AvObjectType::PythonScript, L"Witcher.Test.Python"));
+
+            BuildAhoCorasickUnlocked();
+            g_database_loaded = true;
+            g_release_date = L"default-db";
+            writeCurrentToFiles();
+        };
+
+        if (loadFromFiles(manifestPath, recordsPath, true)) {
+            return true;
+        }
+
+        if (loadFromFiles(backupManifestPath, backupRecordsPath, true)) {
+            writeCurrentToFiles();
+            return true;
+        }
+
+        loadDefaults();
+        return true;
+    }
+
+    bool UpdateDatabaseFromServer() {
+        std::error_code ec;
+
+        auto moduleDir = []() {
+            wchar_t path[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, path, MAX_PATH);
+            return std::filesystem::path(path).parent_path();
+        };
+
+        const auto baseDir = moduleDir();
+        const auto manifestPath = baseDir / L"av_manifest.bin";
+        const auto recordsPath = baseDir / L"av_records.bin";
+        const auto backupManifestPath = baseDir / L"av_manifest.bak";
+        const auto backupRecordsPath = baseDir / L"av_records.bak";
+
+        if (std::filesystem::exists(manifestPath, ec)) {
+            std::filesystem::copy_file(manifestPath, backupManifestPath, std::filesystem::copy_options::overwrite_existing, ec);
+        }
+        if (std::filesystem::exists(recordsPath, ec)) {
+            std::filesystem::copy_file(recordsPath, backupRecordsPath, std::filesystem::copy_options::overwrite_existing, ec);
+        }
+
+        if (LoadDatabaseOnServiceStart()) {
+            return true;
+        }
+
+        if (std::filesystem::exists(backupManifestPath, ec) && std::filesystem::exists(backupRecordsPath, ec)) {
+            std::filesystem::copy_file(backupManifestPath, manifestPath, std::filesystem::copy_options::overwrite_existing, ec);
+            std::filesystem::copy_file(backupRecordsPath, recordsPath, std::filesystem::copy_options::overwrite_existing, ec);
+            return LoadDatabaseOnServiceStart();
+        }
+
+        return LoadDefaultDatabase();
+    }
+
+    bool ForceUpdateDatabaseFromServer() {
+        return UpdateDatabaseFromServer();
+    }
 }

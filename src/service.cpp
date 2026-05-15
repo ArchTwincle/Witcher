@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <rpc.h>
@@ -35,6 +35,7 @@ namespace {
     HANDLE g_license_thread = nullptr;
     HANDLE g_schedule_thread = nullptr;
     HANDLE g_monitor_thread = nullptr;
+    HANDLE g_av_db_update_thread = nullptr;
     HANDLE g_monitor_wakeup_event = nullptr;
 
     CRITICAL_SECTION g_process_lock;
@@ -1011,6 +1012,22 @@ namespace {
         return 0;
     }
 
+
+    DWORD WINAPI AvDatabaseUpdateThread(void*) {
+        constexpr DWORD kUpdateIntervalMs = 15 * 60 * 1000;
+
+        while (g_stop_event) {
+            DWORD wait_result = WaitForSingleObject(g_stop_event, kUpdateIntervalMs);
+
+            if (wait_result == WAIT_OBJECT_0) {
+                break;
+            }
+
+            witcher_av::UpdateDatabaseFromServer();
+        }
+
+        return 0;
+    }
     DWORD WINAPI RpcServerThread(void*) {
         RPC_STATUS status = RpcServerUseProtseqEpW(
             reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
@@ -1093,6 +1110,7 @@ namespace {
         witcher::InitAuthState();
         witcher::InitLicenseState();
         witcher_av::InitializeAvEngine();
+        witcher_av::LoadDatabaseOnServiceStart();
 
         g_monitor_wakeup_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -1143,6 +1161,7 @@ namespace {
         g_license_thread = CreateThread(nullptr, 0, LicenseRefreshThread, nullptr, 0, nullptr);
         g_schedule_thread = CreateThread(nullptr, 0, ScheduledScanThread, nullptr, 0, nullptr);
         g_monitor_thread = CreateThread(nullptr, 0, DirectoryMonitorThread, nullptr, 0, nullptr);
+        g_av_db_update_thread = CreateThread(nullptr, 0, AvDatabaseUpdateThread, nullptr, 0, nullptr);
 
         LaunchTrayAppsInExistingSessions();
 
@@ -1164,6 +1183,12 @@ namespace {
             WaitForSingleObject(g_monitor_thread, 5000);
             CloseHandle(g_monitor_thread);
             g_monitor_thread = nullptr;
+        }
+
+        if (g_av_db_update_thread) {
+            WaitForSingleObject(g_av_db_update_thread, 5000);
+            CloseHandle(g_av_db_update_thread);
+            g_av_db_update_thread = nullptr;
         }
 
         if (g_schedule_thread) {

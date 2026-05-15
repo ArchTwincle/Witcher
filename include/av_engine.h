@@ -47,6 +47,9 @@ namespace witcher_av {
     void FreeAvEngine();
 
     bool LoadDefaultDatabase();
+    bool LoadDatabaseOnServiceStart();
+    bool UpdateDatabaseFromServer();
+    bool ForceUpdateDatabaseFromServer();
     void ClearDatabase();
 
     bool IsDatabaseLoaded();
