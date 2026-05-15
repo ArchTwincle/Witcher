@@ -906,15 +906,7 @@ namespace {
     void StopServiceAndExit() {
         RequestServiceStop();
 
-        /*
-            Do not close the GUI immediately.
-
-            If the user confirms service stop on the private desktop,
-            the service will terminate all launched TrayWin32App.exe processes.
-
-            If the user clicks No or the confirmation cannot be shown,
-            the tray app remains running.
-        */
+      
     }
 
     void ShowTrayMenu(HWND hwnd) {
