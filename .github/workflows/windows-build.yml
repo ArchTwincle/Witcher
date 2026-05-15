@@ -2,9 +2,9 @@ name: Windows Tray Service CI
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "service-rpc-task", "feature/**" ]
   pull_request:
-    branches: [ "main", "master", "service-rpc-task" ]
+    branches: [ "main", "master", "service-rpc-task", "feature/**" ]
 
 jobs:
   build-tray-suite:
