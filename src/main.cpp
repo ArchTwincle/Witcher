@@ -1,4 +1,4 @@
-#include <windows.h>
+﻿#include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <rpc.h>
@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 #include "../resources/resource.h"
 #include "common.h"
@@ -28,6 +29,26 @@ namespace {
     constexpr UINT kMenuOpen = 1001;
     constexpr UINT kMenuExit = 1002;
 
+    constexpr int kControlUsernameEdit = 2001;
+    constexpr int kControlPasswordEdit = 2002;
+    constexpr int kControlLoginButton = 2003;
+    constexpr int kControlLicenseCodeEdit = 2004;
+    constexpr int kControlActivateButton = 2005;
+    constexpr int kControlLogoutButton = 2006;
+    constexpr int kControlRefreshButton = 2007;
+
+    constexpr UINT_PTR kLicensePollTimerId = 3001;
+    constexpr UINT kLicensePollIntervalMs = 30000;
+
+    constexpr wchar_t kProductId[] = L"7a11219b-2bdd-4475-a9fb-c535ce20650d";
+    constexpr wchar_t kMacAddress[] = L"AA-BB-CC-DD-EE-FF";
+
+    enum class UiState {
+        Login,
+        Activation,
+        Main
+    };
+
     HINSTANCE g_instance = nullptr;
     HWND g_main_window = nullptr;
     NOTIFYICONDATAW g_tray_icon{};
@@ -35,10 +56,20 @@ namespace {
     HANDLE g_single_instance_mutex = nullptr;
     bool g_is_exiting = false;
 
+    UiState g_ui_state = UiState::Login;
+    bool g_is_authenticated = false;
+    bool g_has_license = false;
+
+    std::wstring g_username;
+    std::wstring g_license_expiration_date;
+    std::wstring g_last_error_text;
+
+    std::vector<HWND> g_child_controls;
+
     std::wstring ToLower(std::wstring text) {
         std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
             return static_cast<wchar_t>(towlower(ch));
-            });
+        });
 
         return text;
     }
@@ -360,7 +391,7 @@ namespace {
         return parent_name == ToLower(witcher::kServiceExeName);
     }
 
-    void RequestServiceStop() {
+    bool ConnectRpc() {
         RPC_WSTR string_binding = nullptr;
 
         RPC_STATUS status = RpcStringBindingComposeW(
@@ -373,7 +404,7 @@ namespace {
         );
 
         if (status != RPC_S_OK) {
-            return;
+            return false;
         }
 
         status = RpcBindingFromStringBindingW(
@@ -383,21 +414,507 @@ namespace {
 
         RpcStringFreeW(&string_binding);
 
-        if (status != RPC_S_OK) {
+        return status == RPC_S_OK;
+    }
+
+    void DisconnectRpc() {
+        if (WitcherControl_IfHandle) {
+            RpcBindingFree(&WitcherControl_IfHandle);
+            WitcherControl_IfHandle = nullptr;
+        }
+    }
+
+    std::wstring ErrorCodeToText(long error_code) {
+        wchar_t buffer[128]{};
+        wsprintfW(buffer, L"Code: %ld", error_code);
+        return buffer;
+    }
+
+    std::wstring GetWindowTextString(HWND hwnd) {
+        const int length = GetWindowTextLengthW(hwnd);
+
+        if (length <= 0) {
+            return L"";
+        }
+
+        std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1);
+        GetWindowTextW(hwnd, buffer.data(), static_cast<int>(buffer.size()));
+
+        return std::wstring(buffer.data());
+    }
+
+    void ClearChildControls() {
+        for (HWND control : g_child_controls) {
+            if (control) {
+                DestroyWindow(control);
+            }
+        }
+
+        g_child_controls.clear();
+    }
+
+    HWND AddStaticText(
+        HWND parent,
+        const wchar_t* text,
+        int x,
+        int y,
+        int width,
+        int height
+    ) {
+        HWND control = CreateWindowExW(
+            0,
+            L"STATIC",
+            text,
+            WS_CHILD | WS_VISIBLE,
+            x,
+            y,
+            width,
+            height,
+            parent,
+            nullptr,
+            g_instance,
+            nullptr
+        );
+
+        if (control) {
+            g_child_controls.push_back(control);
+        }
+
+        return control;
+    }
+
+    HWND AddEdit(
+        HWND parent,
+        int id,
+        int x,
+        int y,
+        int width,
+        int height,
+        bool password = false
+    ) {
+        DWORD style = WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL;
+
+        if (password) {
+            style |= ES_PASSWORD;
+        }
+
+        HWND control = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"",
+            style,
+            x,
+            y,
+            width,
+            height,
+            parent,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+            g_instance,
+            nullptr
+        );
+
+        if (control) {
+            g_child_controls.push_back(control);
+        }
+
+        return control;
+    }
+
+    HWND AddButton(
+        HWND parent,
+        int id,
+        const wchar_t* text,
+        int x,
+        int y,
+        int width,
+        int height
+    ) {
+        HWND control = CreateWindowExW(
+            0,
+            L"BUTTON",
+            text,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            x,
+            y,
+            width,
+            height,
+            parent,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+            g_instance,
+            nullptr
+        );
+
+        if (control) {
+            g_child_controls.push_back(control);
+        }
+
+        return control;
+    }
+
+    bool RpcGetCurrentUserSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long is_authenticated = 0;
+        wchar_t username_buffer[256]{};
+
+        long result = RpcGetCurrentUser(
+            &is_authenticated,
+            username_buffer,
+            static_cast<unsigned long>(_countof(username_buffer))
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"RpcGetCurrentUser failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_is_authenticated = is_authenticated != 0;
+        g_username = username_buffer;
+        return true;
+    }
+
+    bool RpcGetLicenseInfoSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long has_license = 0;
+        wchar_t expiration_date_buffer[256]{};
+
+        long result = RpcGetLicenseInfo(
+            &has_license,
+            expiration_date_buffer,
+            static_cast<unsigned long>(_countof(expiration_date_buffer))
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"RpcGetLicenseInfo failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_has_license = has_license != 0;
+        g_license_expiration_date = expiration_date_buffer;
+        return true;
+    }
+
+    bool RpcLoginSafe(
+        const std::wstring& username,
+        const std::wstring& password
+    ) {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcLogin(username.c_str(), password.c_str());
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Login failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcLogoutSafe() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcLogout();
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"Logout failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcCheckLicenseSafe(
+        const std::wstring& license_code
+    ) {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcCheckLicense(
+            license_code.c_str(),
+            kMacAddress,
+            kProductId
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"License check failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    bool RpcActivateLicenseSafe(
+        const std::wstring& license_code
+    ) {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            return false;
+        }
+
+        long result = RpcActivateLicense(
+            license_code.c_str(),
+            kMacAddress,
+            kProductId
+        );
+
+        DisconnectRpc();
+
+        if (result != ERROR_SUCCESS) {
+            g_last_error_text = L"License activation failed. " + ErrorCodeToText(result);
+            return false;
+        }
+
+        g_last_error_text.clear();
+        return true;
+    }
+
+    void RefreshApplicationState();
+
+    void BuildLoginView(HWND hwnd) {
+        ClearChildControls();
+
+        AddStaticText(hwnd, L"Authentication required", 40, 35, 300, 24);
+        AddStaticText(hwnd, L"Username:", 40, 90, 120, 24);
+        AddStaticText(hwnd, L"Password:", 40, 135, 120, 24);
+
+        HWND username_edit = AddEdit(hwnd, kControlUsernameEdit, 165, 86, 250, 28);
+        HWND password_edit = AddEdit(hwnd, kControlPasswordEdit, 165, 131, 250, 28, true);
+
+        SetWindowTextW(username_edit, L"admin");
+        SetWindowTextW(password_edit, L"Admin123!");
+
+        AddButton(hwnd, kControlLoginButton, L"Login", 165, 180, 120, 32);
+
+        if (!g_last_error_text.empty()) {
+            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 235, 540, 28);
+        }
+
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+
+    void BuildActivationView(HWND hwnd) {
+        ClearChildControls();
+
+        std::wstring title = L"User: " + g_username;
+
+        AddStaticText(hwnd, title.c_str(), 40, 35, 500, 24);
+        AddStaticText(hwnd, L"No active license. Antivirus functionality is blocked.", 40, 75, 540, 24);
+        AddStaticText(hwnd, L"License code:", 40, 130, 120, 24);
+
+        AddEdit(hwnd, kControlLicenseCodeEdit, 165, 126, 320, 28);
+        AddButton(hwnd, kControlActivateButton, L"Activate", 165, 175, 120, 32);
+        AddButton(hwnd, kControlLogoutButton, L"Logout", 300, 175, 120, 32);
+        AddButton(hwnd, kControlRefreshButton, L"Refresh", 435, 175, 120, 32);
+
+        if (!g_last_error_text.empty()) {
+            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 235, 540, 28);
+        }
+
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+
+    void BuildMainView(HWND hwnd) {
+        ClearChildControls();
+
+        std::wstring username_text = L"User: " + g_username;
+        std::wstring license_text = L"License expires: ";
+
+        if (!g_license_expiration_date.empty()) {
+            license_text += g_license_expiration_date;
+        }
+        else {
+            license_text += L"unknown";
+        }
+
+        AddStaticText(hwnd, username_text.c_str(), 40, 35, 520, 24);
+        AddStaticText(hwnd, L"Antivirus functionality is unlocked.", 40, 75, 520, 24);
+        AddStaticText(hwnd, license_text.c_str(), 40, 115, 520, 24);
+
+        AddButton(hwnd, kControlRefreshButton, L"Refresh status", 40, 170, 140, 32);
+        AddButton(hwnd, kControlLogoutButton, L"Logout", 200, 170, 120, 32);
+
+        if (!g_last_error_text.empty()) {
+            AddStaticText(hwnd, g_last_error_text.c_str(), 40, 235, 540, 28);
+        }
+
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+
+    void BuildCurrentView(HWND hwnd) {
+        if (!hwnd) {
             return;
         }
 
-        RpcTryExcept
-        {
-            RpcStopService();
+        if (g_ui_state == UiState::Login) {
+            BuildLoginView(hwnd);
+            return;
         }
-            RpcExcept(1)
-        {
-        }
-        RpcEndExcept
 
-            RpcBindingFree(&WitcherControl_IfHandle);
-        WitcherControl_IfHandle = nullptr;
+        if (g_ui_state == UiState::Activation) {
+            BuildActivationView(hwnd);
+            return;
+        }
+
+        BuildMainView(hwnd);
+    }
+
+    void RefreshApplicationState() {
+        g_is_authenticated = false;
+        g_has_license = false;
+        g_username.clear();
+        g_license_expiration_date.clear();
+
+        if (!RpcGetCurrentUserSafe()) {
+            g_ui_state = UiState::Login;
+            BuildCurrentView(g_main_window);
+            return;
+        }
+
+        if (!g_is_authenticated) {
+            g_ui_state = UiState::Login;
+            BuildCurrentView(g_main_window);
+            return;
+        }
+
+        if (!RpcGetLicenseInfoSafe()) {
+            g_has_license = false;
+        }
+
+        if (!g_has_license) {
+            g_ui_state = UiState::Activation;
+            BuildCurrentView(g_main_window);
+            return;
+        }
+
+        g_ui_state = UiState::Main;
+        BuildCurrentView(g_main_window);
+    }
+
+    void PollLicenseStateWithoutResettingInput() {
+        if (g_ui_state != UiState::Main) {
+            return;
+        }
+
+        std::wstring old_username = g_username;
+        std::wstring old_expiration = g_license_expiration_date;
+        bool old_has_license = g_has_license;
+
+        g_last_error_text.clear();
+
+        RefreshApplicationState();
+
+        if (old_has_license != g_has_license ||
+            old_username != g_username ||
+            old_expiration != g_license_expiration_date) {
+            BuildCurrentView(g_main_window);
+        }
+    }
+
+    void HandleLogin(HWND hwnd) {
+        HWND username_edit = GetDlgItem(hwnd, kControlUsernameEdit);
+        HWND password_edit = GetDlgItem(hwnd, kControlPasswordEdit);
+
+        std::wstring username = GetWindowTextString(username_edit);
+        std::wstring password = GetWindowTextString(password_edit);
+
+        if (username.empty() || password.empty()) {
+            g_last_error_text = L"Username and password are required.";
+            BuildCurrentView(hwnd);
+            return;
+        }
+
+        if (!RpcLoginSafe(username, password)) {
+            g_ui_state = UiState::Login;
+            BuildCurrentView(hwnd);
+            return;
+        }
+
+        RefreshApplicationState();
+    }
+
+    void HandleActivate(HWND hwnd) {
+        HWND license_edit = GetDlgItem(hwnd, kControlLicenseCodeEdit);
+        std::wstring license_code = GetWindowTextString(license_edit);
+
+        if (license_code.empty()) {
+            g_last_error_text = L"License code is required.";
+            BuildCurrentView(hwnd);
+            return;
+        }
+
+        if (RpcCheckLicenseSafe(license_code)) {
+            RefreshApplicationState();
+            return;
+        }
+
+        std::wstring check_error = g_last_error_text;
+
+        if (!RpcActivateLicenseSafe(license_code)) {
+            std::wstring activate_error = g_last_error_text;
+            g_last_error_text =
+                L"License check failed first. " +
+                check_error +
+                L" Activation also failed. " +
+                activate_error;
+
+            g_ui_state = UiState::Activation;
+            BuildCurrentView(hwnd);
+            return;
+        }
+
+        RefreshApplicationState();
+    }
+
+    void HandleLogout(HWND hwnd) {
+        RpcLogoutSafe();
+
+        g_is_authenticated = false;
+        g_has_license = false;
+        g_username.clear();
+        g_license_expiration_date.clear();
+
+        g_ui_state = UiState::Login;
+        BuildCurrentView(hwnd);
+    }
+
+    void RequestServiceStop() {
+        if (!ConnectRpc()) {
+            g_last_error_text = L"Cannot connect to service RPC.";
+            BuildCurrentView(g_main_window);
+            return;
+        }
+
+        RpcStopService();
+
+        DisconnectRpc();
     }
 
     void ShowMainWindow() {
@@ -436,6 +953,8 @@ namespace {
 
     void ExitApplication() {
         g_is_exiting = true;
+        KillTimer(g_main_window, kLicensePollTimerId);
+        ClearChildControls();
         RemoveTrayIcon();
         PostQuitMessage(0);
     }
@@ -443,15 +962,7 @@ namespace {
     void StopServiceAndExit() {
         RequestServiceStop();
 
-        /*
-            Do not close the GUI immediately.
-
-            If the user confirms the service stop on the private desktop,
-            the service will terminate all launched TrayWin32App.exe processes.
-
-            If the user clicks No or the confirmation cannot be shown,
-            the tray app remains running.
-        */
+      
     }
 
     void ShowTrayMenu(HWND hwnd) {
@@ -517,47 +1028,18 @@ namespace {
         FillRect(hdc, &rect, background);
         DeleteObject(background);
 
-        HPEN shadow_pen = CreatePen(PS_SOLID, 16, RGB(20, 20, 20));
-        HGDIOBJ old_pen = SelectObject(hdc, shadow_pen);
-
-        MoveToEx(hdc, 190, 85, nullptr);
-        LineTo(hdc, 110, 305);
-
-        MoveToEx(hdc, 310, 85, nullptr);
-        LineTo(hdc, 230, 305);
-
-        MoveToEx(hdc, 430, 85, nullptr);
-        LineTo(hdc, 350, 305);
-
-        SelectObject(hdc, old_pen);
-        DeleteObject(shadow_pen);
-
-        HPEN red_pen = CreatePen(PS_SOLID, 10, RGB(170, 0, 0));
-        old_pen = SelectObject(hdc, red_pen);
-
-        MoveToEx(hdc, 180, 80, nullptr);
-        LineTo(hdc, 100, 300);
-
-        MoveToEx(hdc, 300, 80, nullptr);
-        LineTo(hdc, 220, 300);
-
-        MoveToEx(hdc, 420, 80, nullptr);
-        LineTo(hdc, 340, 300);
-
-        SelectObject(hdc, old_pen);
-        DeleteObject(red_pen);
-
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(230, 230, 230));
 
-        RECT text_rect = rect;
-        text_rect.top = rect.bottom - 70;
+        RECT title_rect = rect;
+        title_rect.top = 300;
+        title_rect.bottom = 360;
 
         DrawTextW(
             hdc,
             L"Tourism Service Tray App",
             -1,
-            &text_rect,
+            &title_rect,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE
         );
 
@@ -573,7 +1055,18 @@ namespace {
         switch (message) {
         case WM_CREATE:
             AddTrayIcon(hwnd);
+            g_main_window = hwnd;
+            SetTimer(hwnd, kLicensePollTimerId, kLicensePollIntervalMs, nullptr);
+            RefreshApplicationState();
             return 0;
+
+        case WM_TIMER:
+            if (w_param == kLicensePollTimerId) {
+                PollLicenseStateWithoutResettingInput();
+                return 0;
+            }
+
+            break;
 
         case kTrayCallbackMessage:
             switch (LOWORD(l_param)) {
@@ -594,6 +1087,23 @@ namespace {
 
         case WM_COMMAND:
             switch (LOWORD(w_param)) {
+            case kControlLoginButton:
+                HandleLogin(hwnd);
+                return 0;
+
+            case kControlActivateButton:
+                HandleActivate(hwnd);
+                return 0;
+
+            case kControlLogoutButton:
+                HandleLogout(hwnd);
+                return 0;
+
+            case kControlRefreshButton:
+                g_last_error_text.clear();
+                RefreshApplicationState();
+                return 0;
+
             case kMenuExit:
                 StopServiceAndExit();
                 return 0;
@@ -617,6 +1127,8 @@ namespace {
             break;
 
         case WM_DESTROY:
+            KillTimer(hwnd, kLicensePollTimerId);
+            ClearChildControls();
             RemoveTrayIcon();
             PostQuitMessage(0);
             return 0;
