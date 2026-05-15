@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <wincrypt.h>
 #include <wininet.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "winhttp.lib")
 
 namespace witcher_av {
 
@@ -903,6 +905,99 @@ namespace witcher_av {
         const auto backupManifestPath = baseDir / L"av_manifest.bak";
         const auto backupRecordsPath = baseDir / L"av_records.bak";
 
+        auto downloadBinary = [&](const wchar_t* endpoint, std::string* out) -> bool {
+            if (!out) {
+                return false;
+            }
+
+            out->clear();
+
+            HINTERNET session = WinHttpOpen(
+                L"WitcherTrayService/1.0",
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS,
+                0
+            );
+            if (!session) {
+                return false;
+            }
+
+            HINTERNET connect = WinHttpConnect(session, L"localhost", 8443, 0);
+            if (!connect) {
+                WinHttpCloseHandle(session);
+                return false;
+            }
+
+            HINTERNET request = WinHttpOpenRequest(
+                connect,
+                L"GET",
+                endpoint,
+                nullptr,
+                WINHTTP_NO_REFERER,
+                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                WINHTTP_FLAG_SECURE
+            );
+            if (!request) {
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                return false;
+            }
+
+            DWORD securityFlags =
+                SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+            WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
+
+            if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) ||
+                !WinHttpReceiveResponse(request, nullptr)) {
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                return false;
+            }
+
+            DWORD statusCode = 0;
+            DWORD statusCodeSize = sizeof(statusCode);
+            if (!WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &statusCode,
+                &statusCodeSize,
+                WINHTTP_NO_HEADER_INDEX
+            ) || statusCode != 200) {
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                return false;
+            }
+
+            while (true) {
+                DWORD availableSize = 0;
+                if (!WinHttpQueryDataAvailable(request, &availableSize)) {
+                    break;
+                }
+                if (availableSize == 0) {
+                    break;
+                }
+
+                std::string chunk(availableSize, '\0');
+                DWORD downloaded = 0;
+                if (!WinHttpReadData(request, chunk.data(), availableSize, &downloaded)) {
+                    break;
+                }
+                chunk.resize(downloaded);
+                *out += chunk;
+            }
+
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return !out->empty();
+        };
         auto sign = [&](const std::vector<unsigned char>& payload) {
             std::vector<unsigned char> signedPayload;
             signedPayload.insert(signedPayload.end(), kSigKey, kSigKey + sizeof(kSigKey) - 1);
@@ -1100,6 +1195,50 @@ namespace witcher_av {
             return std::filesystem::path(path).parent_path();
         };
 
+        auto downloadBinary = [&](const wchar_t* endpoint, std::string* out) -> bool {
+            if (!out) { return false; }
+            out->clear();
+
+            HINTERNET session = WinHttpOpen(L"WitcherTrayService/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+            if (!session) { return false; }
+            HINTERNET connect = WinHttpConnect(session, L"localhost", 8443, 0);
+            if (!connect) { WinHttpCloseHandle(session); return false; }
+            HINTERNET request = WinHttpOpenRequest(connect, L"GET", endpoint, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+            if (!request) { WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return false; }
+
+            DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+            WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
+
+            if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) ||
+                !WinHttpReceiveResponse(request, nullptr)) {
+                WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return false;
+            }
+
+            DWORD statusCode = 0;
+            DWORD statusCodeSize = sizeof(statusCode);
+            if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX) || statusCode != 200) {
+                WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return false;
+            }
+
+            while (true) {
+                DWORD availableSize = 0;
+                if (!WinHttpQueryDataAvailable(request, &availableSize) || availableSize == 0) {
+                    break;
+                }
+
+                std::string chunk(availableSize, '\0');
+                DWORD downloadedSize = 0;
+                if (!WinHttpReadData(request, chunk.data(), availableSize, &downloadedSize)) {
+                    break;
+                }
+                chunk.resize(downloadedSize);
+                *out += chunk;
+            }
+
+            WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session);
+            return !out->empty();
+        };
+
         const auto baseDir = moduleDir();
         const auto manifestPath = baseDir / L"av_manifest.bin";
         const auto recordsPath = baseDir / L"av_records.bin";
@@ -1111,6 +1250,18 @@ namespace witcher_av {
         }
         if (std::filesystem::exists(recordsPath, ec)) {
             std::filesystem::copy_file(recordsPath, backupRecordsPath, std::filesystem::copy_options::overwrite_existing, ec);
+        }
+
+        std::string manifestBytes;
+        std::string recordBytes;
+        if (downloadBinary(L"/api/avdb/manifest", &manifestBytes) && downloadBinary(L"/api/avdb/records", &recordBytes)) {
+            std::ofstream manOut(manifestPath, std::ios::binary | std::ios::trunc);
+            manOut.write(manifestBytes.data(), static_cast<std::streamsize>(manifestBytes.size()));
+            manOut.close();
+
+            std::ofstream recOut(recordsPath, std::ios::binary | std::ios::trunc);
+            recOut.write(recordBytes.data(), static_cast<std::streamsize>(recordBytes.size()));
+            recOut.close();
         }
 
         if (LoadDatabaseOnServiceStart()) {
@@ -1125,7 +1276,6 @@ namespace witcher_av {
 
         return LoadDefaultDatabase();
     }
-
     bool ForceUpdateDatabaseFromServer() {
         return UpdateDatabaseFromServer();
     }
