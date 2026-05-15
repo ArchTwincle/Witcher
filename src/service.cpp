@@ -899,7 +899,7 @@ namespace {
 
             witcher_av::ScanResult result{};
 
-            if (witcher_av::ScanFixedDrives(&result)) {
+            if (witcher_av::ScanDirectory(L"C:\\Users\\Stanislav\\Desktop\\av_test", &result)) {
                 EnterCriticalSection(&g_av_options_lock);
                 g_scheduled_scan_last_result = result;
                 LeaveCriticalSection(&g_av_options_lock);

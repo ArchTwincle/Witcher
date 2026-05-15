@@ -897,7 +897,7 @@ namespace {
             return false;
         }
 
-        long result = RpcSetScheduledScan(1, 1);
+        long result = RpcSetScheduledScan(1, 10);
 
         DisconnectRpc();
 
@@ -906,7 +906,7 @@ namespace {
             return false;
         }
 
-        g_schedule_status_text = L"Scheduled scan enabled. Interval: 1 minute.";
+        g_schedule_status_text = L"Scheduled scan enabled. Interval: 10 sec..";
         g_last_error_text.clear();
         return true;
     }
@@ -964,7 +964,7 @@ namespace {
             (is_enabled ? L"enabled" : L"disabled") +
             L", interval: " +
             std::to_wstring(interval_minutes) +
-            L" min, last scanned: " +
+            L" sec, last scanned: " +
             std::to_wstring(scanned_files) +
             L", last malicious: " +
             std::to_wstring(malicious_files);
@@ -1519,11 +1519,11 @@ namespace {
             case kControlRefreshButton:
                 g_last_error_text.clear();
 
-                if (g_is_authenticated && g_has_license) {
-                    RpcRefreshLicenseStatusSafe();
-                }
+                RpcGetAvDatabaseInfoSafe();
+                RpcRefreshScheduleStatusSafe();
+                RpcRefreshMonitorStatusSafe();
 
-                RefreshApplicationState();
+                BuildCurrentView(hwnd);
                 return 0;
 
             case kControlScanFileButton:

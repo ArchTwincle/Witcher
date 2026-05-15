@@ -796,6 +796,8 @@ namespace witcher_av {
             return false;
         }
 
+        constexpr unsigned long long kMaxFilesForDemo = 3000;
+
         for (wchar_t letter = L'A'; letter <= L'Z'; ++letter) {
             DWORD bit = 1u << (letter - L'A');
 
@@ -813,14 +815,45 @@ namespace witcher_av {
                 continue;
             }
 
-            ScanResult drive_result{};
+            std::error_code error;
 
-            if (!ScanDirectory(root, &drive_result)) {
-                continue;
+            std::filesystem::recursive_directory_iterator iterator(
+                root,
+                std::filesystem::directory_options::skip_permission_denied,
+                error
+            );
+
+            std::filesystem::recursive_directory_iterator end;
+
+            while (!error && iterator != end) {
+                const std::wstring current_path = iterator->path().wstring();
+
+                if (current_path.find(L"\\Windows\\") != std::wstring::npos ||
+                    current_path.find(L"\\Program Files\\") != std::wstring::npos ||
+                    current_path.find(L"\\Program Files (x86)\\") != std::wstring::npos ||
+                    current_path.find(L"\\AppData\\") != std::wstring::npos ||
+                    current_path.find(L"\\System Volume Information\\") != std::wstring::npos ||
+                    current_path.find(L"\\$Recycle.Bin\\") != std::wstring::npos) {
+                    iterator.disable_recursion_pending();
+                    iterator.increment(error);
+                    continue;
+                }
+
+                if (IsRegularFile(*iterator)) {
+                    ScanResult local_result{};
+                    ++result->scannedFiles;
+
+                    if (ScanFile(iterator->path().wstring(), &local_result)) {
+                        MergeDirectoryResult(result, local_result);
+                    }
+
+                    if (result->scannedFiles >= kMaxFilesForDemo) {
+                        return true;
+                    }
+                }
+
+                iterator.increment(error);
             }
-
-            result->scannedFiles += drive_result.scannedFiles;
-            MergeDirectoryResult(result, drive_result);
         }
 
         return true;
