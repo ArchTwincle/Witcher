@@ -4,6 +4,7 @@
 #include <rpc.h>
 #include <commdlg.h>
 #include <shlobj.h>
+#include <sddl.h>
 
 #include <algorithm>
 #include <string>
